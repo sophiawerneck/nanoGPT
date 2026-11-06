@@ -3,7 +3,6 @@ brotli==1.2.1
 brotlicffi==1.2.1.0
 chardet==7.7.0
 ConfigParser==7.3.0
-cryptography==50.0.2
 datasets==5.1.0
 docutils==0.23
 filelock==4.2.9
@@ -17,7 +16,6 @@ pyOpenSSL==26.4.0
 pytest==9.2.0
 redis==8.1.0
 simplejson==4.2.0
-Sphinx==9.2.0
 thread==2.0.6
 tiktoken==0.14.0
 torch==2.15.0
