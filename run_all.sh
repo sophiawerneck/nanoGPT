@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Script principal de execução: dados -> treino de todas as variantes e sementes.
-# execuções concluídas são puladas e as interrompidas são retomadas.
+# Idempotente: execuções concluídas são puladas e as interrompidas são retomadas.
 #
-# As etapas de avaliação (Membro 4), benchmark e agregação (Membro 3) rodam
-# automaticamente quando os respectivos scripts existirem no repositório:
+# As etapas de avaliação, benchmark e agregação rodam
+# em sequência:
 #   evaluate.py  --out_dir <execução>   -> perda/perplexidade final
 #   benchmark.py --out_dir <execução>   -> latência de inferência
 #   summarize.py --out_root <pasta>     -> tabelas e speedup
@@ -55,14 +55,12 @@ train_and_evaluate() {
     fi
   fi
 
-  if [[ -f evaluate.py ]]; then python evaluate.py --out_dir "$out"; fi
-  if [[ -f benchmark.py ]]; then python benchmark.py --out_dir "$out"; fi
+  python evaluate.py --out_dir "$out"
+  python benchmark.py --out_dir "$out"
 }
 
 summarize_results() {
-  if [[ -f summarize.py ]]; then 
-    python summarize.py --out_root "out/${DATASET}"
-  fi
+  python summarize.py --out_root "out/${DATASET}"
 }
 
 main() {
