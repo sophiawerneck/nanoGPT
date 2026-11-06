@@ -447,6 +447,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--init_from', default='scratch', choices=['scratch', 'resume'])
     p.add_argument('--seed', type=int, default=1337)
     p.add_argument('--out_dir', default=None, help='padrão: out/<block_type>_s<seed>')
+    p.add_argument('--dataset', default='c4', choices=list(DATASET_PRESETS),
+                   help='c4 (experimento) ou shakespeare_char (depuração); define os padrões')
     p.add_argument('--data_dir', default=os.path.join(BASE_DIR, 'data', 'c4'))
 
     p.add_argument('--eval_interval', type=int, default=250)
