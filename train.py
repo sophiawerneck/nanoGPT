@@ -1,5 +1,24 @@
 """Treinamento das variantes de bloco (seq, inv, par) do GPT (~124M) no C4.
 
+Fluxo de Funcionamento:
+- Inicialização e configuração: Valida hiperparâmetros, configura o ambiente 
+  distribuído (DDP) se exigido, fixa as sementes (reprodutibilidade) e carrega 
+  as identidades (hashes/tamanhos) dos arquivos de dados gerados na preparação.
+- Amostragem de dados: Estabelece o `TrainSampler`, de forma a garantir uma amostragem 
+  determinística sem reposição. Separa subconjuntos estáticos de treino e validação 
+  para monitoramento isolado e avaliações imparciais.
+- Modelo e retomada: Constrói a arquitetura GPT do zero (com compilação opcional 
+  via torch.compile) ou restaura o estado exato de um checkpoint (pesos, otimizador, 
+  RNG states e passo iterativo).
+- Loop de treino: Computa o decaimento cosseno da taxa de aprendizado, propaga 
+  os micro-lotes acumulando gradientes (mixed precision via GradScaler), aplica 
+  clipping e atualiza os parâmetros.
+- Avaliação e registro (Logging): Periodicamente avalia as perdas de validação e 
+  treino sem impactar os gradientes, salva checkpoints e exporta estatísticas vitais 
+  para um CSV de métricas em tempo real (throughput, step time, MFU).
+- Finalização: Concluído o limite de orçamento (max_iters), gera e grava um 
+  summary.json consolidando o custo computacional e os resultados finais.
+
 Uma GPU:
   python train.py --block_type seq --seed 1337
 DDP em 4 GPUs de um nó:
