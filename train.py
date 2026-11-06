@@ -62,20 +62,18 @@ METRIC_COLUMNS = [
     'train_ppl',
     'val_ppl',
     'lr',
-    'step_time_ms',     # média dos passos estáveis desde a última avaliação
-    'tokens_per_s',     # throughput de treino no mesmo intervalo (por processo x world_size)
-    'train_time_s',     # tempo acumulado de treino (sem avaliação)
-    'eval_time_s',      # tempo acumulado gasto em # tempo acumulado gasto em avaliação
+    'step_time_ms', # média dos passos estáveis desde a última avaliação
+    'tokens_per_s', # throughput de treino no mesmo intervalo (por processo x world_size)
+    'train_time_s', # tempo acumulado de treino (sem avaliação)
+    'eval_time_s', # tempo acumulado gasto em avaliação
 ]
 
-    
 class TrainSampler:
     """Ordem sem reposição sobre as janelas de treino.
 
     A amostra global de índice s pertence à época s // n e ocupa a posição
     s % n de uma permutação gerada com (seed, época). O lote de qualquer
-    iteração pode ser recalculado a partir de iter_num, o que torna a
-    retomada exata sem guardar o estado do carregador.
+    iteração pode ser recalculado a partir de iter_num.
     """
 
     def __init__(self, num_windows, seed):
@@ -114,7 +112,7 @@ def estimate_loss(model, ctx, monitor, batch_size, block_size, device, device_ty
         out[split] = float(np.mean(losses))
     model.train()
     return out
-    
+
 def get_lr(it, warmup_iters, lr_decay_iters, learning_rate, min_lr):
     if it < warmup_iters:
         return learning_rate * (it + 1) / (warmup_iters + 1)
@@ -163,8 +161,8 @@ def save_checkpoint(path, checkpoint):
 
 def new_timing():
     return {
-        'train_time_s': 0.0,    # todos os passos (inclui compilação), sem avaliação
-        'warmup_time_s': 0.0,   # passos excluídos da média estável
+        'train_time_s': 0.0, # todos os passos (inclui compilação), sem avaliação
+        'warmup_time_s': 0.0, # passos excluídos da média estável
         'steady_time_s': 0.0,
         'steady_sq_s': 0.0,
         'steady_iters': 0,
@@ -189,7 +187,7 @@ def prepare_metrics_file(metrics_file, init_from, resume_iter, reevaluates_resum
         writer = csv.DictWriter(f, fieldnames=METRIC_COLUMNS, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(previous_rows)
-        
+
 def train_loop(model, raw_model, optimizer, scaler, ctx, cfg, rt, timing):
     micro_per_rank = cfg.grad_accum_per_rank
     micro_total = micro_per_rank * rt.world_size
@@ -258,8 +256,7 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg, rt, timing):
                         f"{timing['eval_time_s']:.2f}",
                     ])
 
-                # Sempre o checkpoint mais recente: não há seleção de modelo;
-                # o modelo avaliado é o final (iteração max_iters).
+                # não há seleção de modelo; o modelo avaliado é o final (iteração max_iters).
                 if iter_num > 0:
                     save_checkpoint(rt.checkpoint_path, {
                         'model': raw_model.state_dict(),
@@ -325,8 +322,6 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg, rt, timing):
         if iter_num % cfg.log_interval == 0 and rt.master:
             lossf = loss_accum.item()
             if steady:
-                # estimate_mfu do nanoGPT assume pico de 312 TFLOPS (A100 bf16);
-                # reescala para o pico da GPU informada
                 mfu = raw_model.estimate_mfu(cfg.batch_size * micro_per_rank, dt)
                 mfu *= 312.0 / cfg.peak_tflops
                 running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
@@ -337,7 +332,7 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg, rt, timing):
         local_iter += 1
 
     return iter_num, last_losses
-
+  
 def parse_args():
     p = argparse.ArgumentParser(description="Treinamento das variantes de bloco do GPT no C4")
     BOOL = argparse.BooleanOptionalAction
@@ -381,6 +376,8 @@ def parse_args():
     p.add_argument('--device', default='cuda')
     p.add_argument('--dtype', default=None, choices=['float32', 'bfloat16', 'float16'])
     p.add_argument('--compile', action=BOOL, default=True)
+    p.add_argument('--allow_multi_epoch', action='store_true',
+                   help='permite que o orçamento ultrapasse uma época do train.bin')
     p.add_argument('--timing_warmup_iters', type=int, default=10,
                    help='iterações iniciais de cada processo excluídas da média de tempo')
     p.add_argument('--peak_tflops', type=float, default=312.0,
@@ -408,6 +405,7 @@ def main():
     rt = Runtime()
     rt.ddp = int(os.environ.get('RANK', -1)) != -1
     if rt.ddp:
+        # Timeout maior: só o rank 0 avalia enquanto os demais aguardam na barreira.
         init_process_group(backend=cfg.backend, timeout=timedelta(minutes=60))
         rt.rank = int(os.environ['RANK'])
         local_rank = int(os.environ['LOCAL_RANK'])
@@ -437,6 +435,8 @@ def main():
     if rt.master:
         os.makedirs(cfg.out_dir, exist_ok=True)
 
+    # Semente: inicialização do modelo (idêntica em todos os ranks; o DDP
+    # também a difunde a partir do rank 0) e ordem dos dados.
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
@@ -454,7 +454,6 @@ def main():
     rt.monitor = {
         'train': (rt.train_path,
                   np.random.default_rng(MONITOR_SEED).choice(n_train, n_monitor, replace=False)),
-        # Primeiras janelas da validação; evaluate.py usa as demais.
         'val': (val_path, np.arange(n_monitor)),
     }
 
@@ -494,6 +493,11 @@ def main():
     planned_tokens = cfg.max_iters * tokens_per_iter
     planned_epochs = cfg.max_iters * cfg.grad_accum * cfg.batch_size / n_train
 
+    if planned_epochs > 1 and not cfg.allow_multi_epoch:
+        raise ValueError(
+            f"O orçamento ({cfg.max_iters * cfg.grad_accum * cfg.batch_size:,} janelas) excede "
+            f"as {n_train:,} janelas do train.bin. Reduza max_iters ou use --allow_multi_epoch.")
+
     if rt.master:
         print("==== Iniciando treinamento ====")
         print(f"Variante: {cfg.block_type.upper()} | semente: {cfg.seed} | world_size: {rt.world_size}")
@@ -502,8 +506,6 @@ def main():
         print(f"Tokens planejados: {planned_tokens:,} | "
               f"tokens/parâmetro: {planned_tokens / total_params:.2f}")
         print(f"Janelas de treino: {n_train:,} | épocas planejadas: {planned_epochs:.4f}")
-        if planned_epochs > 1:
-            print("Aviso: o orçamento excede uma época; janelas serão revistas.")
 
         run_info = {
             'config': cfg.as_dict(),
