@@ -604,11 +604,13 @@ def run(cfg: Config, rt: Runtime) -> None:
     rt.checkpoint_path = os.path.join(cfg.out_dir, 'ckpt.pt')
     rt.metrics_file = os.path.join(cfg.out_dir, f'metrics_{cfg.block_type}.csv')
     rt.train_path = os.path.join(cfg.data_dir, 'train.bin')
-    val_path = os.path.join(cfg.data_dir, 'validation.bin')
+    val_path = find_val_file(cfg.data_dir)
     for path in (rt.train_path, val_path):
         if not os.path.exists(path):
-            raise FileNotFoundError(f"{path} não encontrado. Rode prepare_c4.py antes.")
-
+            raise FileNotFoundError(
+                f"{path} não encontrado. Prepare o dataset com: "
+                f"{DATASET_HINTS[cfg.dataset]}"
+            )
     if rt.master:
         os.makedirs(cfg.out_dir, exist_ok=True)
 
@@ -642,7 +644,8 @@ def run(cfg: Config, rt: Runtime) -> None:
 
     model_args = dict(
         n_layer=cfg.n_layer, n_head=cfg.n_head, n_embd=cfg.n_embd,
-        block_size=cfg.block_size, bias=cfg.bias, vocab_size=50304,
+        block_size=cfg.block_size, bias=cfg.bias,
+        vocab_size=dataset_vocab_size(cfg.data_dir),
         dropout=cfg.dropout, block_type=cfg.block_type,
     )
     checkpoint = None
