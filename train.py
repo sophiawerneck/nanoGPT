@@ -45,7 +45,7 @@ import csv
 import argparse
 from datetime import timedelta
 from typing import Any
-
+import pickle
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -56,7 +56,7 @@ from model import GPTConfig, GPT
 from common import (
     BASE_DIR, count_windows, load_windows, default_dtype, autocast_ctx, sync,
     strip_compile_prefix, count_params, environment_info, write_json, read_json,
-)
+    file_sha256,
 
 # Datasets suportados. Cada um define seus próprios padrões; qualquer argumento
 # passado explicitamente na linha de comando tem precedência.
