@@ -57,6 +57,7 @@ from common import (
     BASE_DIR, count_windows, load_windows, default_dtype, autocast_ctx, sync,
     strip_compile_prefix, count_params, environment_info, write_json, read_json,
     file_sha256,
+)
 
 # Datasets suportados. Cada um define seus próprios padrões; qualquer argumento
 # passado explicitamente na linha de comando tem precedência.
@@ -464,7 +465,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--out_dir', default=None, help='padrão: out/<block_type>_s<seed>')
     p.add_argument('--dataset', default='c4', choices=list(DATASET_PRESETS),
                    help='c4 (experimento) ou shakespeare_char (depuração); define os padrões')
-    p.add_argument('--data_dir', default=os.path.join(BASE_DIR, 'data', 'c4'))
+    p.add_argument('--data_dir', default=None)
 
     p.add_argument('--eval_interval', type=int, default=250)
     p.add_argument('--log_interval', type=int, default=1)
@@ -746,6 +747,7 @@ def run(cfg: Config, rt: Runtime) -> None:
         std_s = math.sqrt(max(var, 0.0)) if n else float('nan')
         iters_per_epoch = n_train / (cfg.grad_accum * cfg.batch_size)
         summary = {
+            'dataset': cfg.dataset,
             'block_type': cfg.block_type,
             'seed': cfg.seed,
             'iters': final_iter,
