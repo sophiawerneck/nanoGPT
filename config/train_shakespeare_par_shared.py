@@ -1,4 +1,4 @@
-# Paralelo: FFN || MHA
+# Paralelo com LN compartilhada (par_shared)
 # train a miniature character-level shakespeare model
 # good for debugging and playing on macbooks and such
 
