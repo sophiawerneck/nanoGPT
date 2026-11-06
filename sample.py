@@ -2,6 +2,7 @@
 Sample from a trained model
 """
 import os
+import argparse
 import pickle
 from contextlib import nullcontext
 import torch
@@ -10,18 +11,31 @@ from model import GPTConfig, GPT
 import time
 
 # -----------------------------------------------------------------------------
-init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
-out_dir = 'out' # ignored if init_from is not 'resume'
-start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
-num_samples = 10 # number of samples to draw
-max_new_tokens = 500 # number of tokens generated in each sample
-temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
-top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
-seed = 1337
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-compile = False # use PyTorch 2.0 to compile the model to be faster
-exec(open('configurator.py').read()) # overrides from command line or config file
+parser = argparse.ArgumentParser(description="Sample from a trained model")
+parser.add_argument('--init_from', type=str, default='resume')
+parser.add_argument('--out_dir', type=str, default='out')
+parser.add_argument('--start', type=str, default='\n')
+parser.add_argument('--num_samples', type=int, default=10)
+parser.add_argument('--max_new_tokens', type=int, default=500)
+parser.add_argument('--temperature', type=float, default=0.8)
+parser.add_argument('--top_k', type=int, default=200)
+parser.add_argument('--seed', type=int, default=1337)
+parser.add_argument('--device', type=str, default='cuda')
+parser.add_argument('--dtype', type=str, default=None)
+parser.add_argument('--compile', action='store_true')
+args = parser.parse_args()
+
+init_from = args.init_from
+out_dir = args.out_dir
+start = args.start
+num_samples = args.num_samples
+max_new_tokens = args.max_new_tokens
+temperature = args.temperature
+top_k = args.top_k
+seed = args.seed
+device = args.device
+dtype = args.dtype if args.dtype is not None else ('bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16')
+compile = args.compile
 # -----------------------------------------------------------------------------
 
 torch.manual_seed(seed)

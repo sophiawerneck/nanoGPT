@@ -28,7 +28,7 @@ def count_tokens(path):
 
 
 def count_windows(path, block_size):
-    """Número de janelas NÃO sobrepostas de block_size tokens (+1 para o alvo)."""
+    """Número de janelas não sobrepostas de block_size tokens (+1 para o alvo)."""
     return (count_tokens(path) - 1) // block_size
 
 
