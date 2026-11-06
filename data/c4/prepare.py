@@ -1,5 +1,20 @@
 """Prepara o C4 (en) tokenizado com o BPE do GPT-2 em arquivos binários uint16.
 
+Fluxo de Funcionamento:
+- Inicialização: Configura caminhos, sementes, limites de tokens e resolve o 
+  commit (revision) do dataset no Hugging Face Hub para fixar a versão.
+- Sanidade: Realiza um teste preliminar em 1.000 documentos para garantir que 
+  a tokenização em lote é equivalente à sequencial e que o empacotamento com EOT 
+  (End Of Text) é perfeitamente reversível.
+- Processamento (Streaming): Baixa os textos sob demanda, embaralha de forma 
+  determinística e aplica a tokenização em múltiplas threads.
+- Escrita e Checkpointing: Concatena os tokens delimitados por EOT e grava 
+  no disco em blocos (FLUSH_TOKENS). A cada escrita, o estado é atualizado 
+  (arquivos *.state.json) para permitir a retomada exata em caso de falha.
+- Verificação: Ao finalizar ou retomar, os últimos documentos no disco são 
+  comparados com o stream original para assegurar a consistência da ordem. 
+  Um SHA-256 do arquivo final é gerado para conferência de reprodutibilidade.
+
 Saída (em data/c4/):
   train.bin, validation.bin               tokens concatenados, documentos separados por EOT
   train_meta.json, validation_meta.json   configuração, contagens e SHA-256 do .bin
