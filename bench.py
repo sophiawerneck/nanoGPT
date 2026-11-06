@@ -1,24 +1,32 @@
 """
-A much shorter version of train.py for benchmarking
+A much shorter version of train.py for benchmarking inference latency.
 """
 import os
-from contextlib import nullcontext
-import numpy as np
 import time
+import json
+import argparse
+from contextlib import nullcontext
 import torch
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
-batch_size = 12
-block_size = 1024
-bias = False
-real_data = True
-seed = 1337
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1', etc.
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
-compile = True # use PyTorch 2.0 to compile the model to be faster
-profile = False # use pytorch profiler, or just simple benchmarking?
-exec(open('configurator.py').read()) # overrides from command line or config file
+parser = argparse.ArgumentParser(description="Benchmark inference latency")
+parser.add_argument('--out_dir', type=str, default='out')
+parser.add_argument('--device', type=str, default='cuda')
+parser.add_argument('--dtype', type=str, default=None)
+parser.add_argument('--compile', action='store_true')
+parser.add_argument('--max_new_tokens', type=int, default=200)
+parser.add_argument('--num_samples', type=int, default=5)
+parser.add_argument('--seed', type=int, default=1337)
+args = parser.parse_args()
+
+out_dir = args.out_dir
+device = args.device
+dtype = args.dtype if args.dtype is not None else ('bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16')
+compile = args.compile
+max_new_tokens = args.max_new_tokens
+num_samples = args.num_samples
+seed = args.seed
 # -----------------------------------------------------------------------------
 
 torch.manual_seed(seed)
@@ -29,89 +37,76 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# data loading init
-if real_data:
-    dataset = 'openwebtext'
-    data_dir = os.path.join('data', dataset)
-    train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    def get_batch(split):
-        data = train_data # note ignore split in benchmarking script
-        ix = torch.randint(len(data) - block_size, (batch_size,))
-        x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-        return x, y
-else:
-    # alternatively, if fixed data is desired to not care about data loading
-    x = torch.randint(50304, (batch_size, block_size), device=device)
-    y = torch.randint(50304, (batch_size, block_size), device=device)
-    get_batch = lambda split: (x, y)
-
-# model init
-gptconf = GPTConfig(
-    block_size = block_size, # how far back does the model look? i.e. context size
-    n_layer = 12, n_head = 12, n_embd = 768, # size of the model
-    dropout = 0, # for determinism
-    bias = bias,
-)
+# model init from checkpoint
+ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+gptconf = GPTConfig(**checkpoint['model_args'])
 model = GPT(gptconf)
-model.to(device)
 
-optimizer = model.configure_optimizers(weight_decay=1e-2, learning_rate=1e-4, betas=(0.9, 0.95), device_type=device_type)
+state_dict = checkpoint['model']
+unwanted_prefix = '_orig_mod.'
+for k,v in list(state_dict.items()):
+    if k.startswith(unwanted_prefix):
+        state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+model.load_state_dict(state_dict)
+
+model.eval()
+model.to(device)
 
 if compile:
     print("Compiling model...")
     model = torch.compile(model) # pytorch 2.0
 
-if profile:
-    # useful docs on pytorch profiler:
-    # - tutorial https://pytorch.org/tutorials/intermediate/tensorboard_profiler_tutorial.html
-    # - api https://pytorch.org/docs/stable/profiler.html#torch.profiler.profile
-    wait, warmup, active = 5, 5, 5
-    num_steps = wait + warmup + active
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-        schedule=torch.profiler.schedule(wait=wait, warmup=warmup, active=active, repeat=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler('./bench_log'),
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False, # incurs an additional overhead, disable if not needed
-        with_flops=True,
-        with_modules=False, # only for torchscript models atm
-    ) as prof:
+# dummy prompt for latency testing (10 tokens)
+prompt_length = 10
+x = torch.randint(0, gptconf.vocab_size, (1, prompt_length), dtype=torch.long, device=device)
 
-        X, Y = get_batch('train')
-        for k in range(num_steps):
-            with ctx:
-                logits, loss = model(X, Y)
-            X, Y = get_batch('train')
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-            lossf = loss.item()
-            print(f"{k}/{num_steps} loss: {lossf:.4f}")
+# -----------------------------------------------------------------------------
+# benchmarking
+generate_times = []
 
-            prof.step() # notify the profiler at end of each step
-
-else:
-
-    # simple benchmarking
+print("Warming up...")
+with torch.no_grad():
+    with ctx:
+        _ = model.generate(x, max_new_tokens=10, temperature=0.8, top_k=200)
+if device_type == 'cuda':
     torch.cuda.synchronize()
-    for stage, num_steps in enumerate([10, 20]): # burnin, then benchmark
-        t0 = time.time()
-        X, Y = get_batch('train')
-        for k in range(num_steps):
-            with ctx:
-                logits, loss = model(X, Y)
-            X, Y = get_batch('train')
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-            lossf = loss.item()
-            print(f"{k}/{num_steps} loss: {lossf:.4f}")
-        torch.cuda.synchronize()
-        t1 = time.time()
-        dt = t1-t0
-        mfu = model.estimate_mfu(batch_size * 1 * num_steps, dt)
-        if stage == 1:
-            print(f"time per iteration: {dt/num_steps*1000:.4f}ms, MFU: {mfu*100:.2f}%")
+
+print("Benchmarking...")
+with torch.no_grad():
+    with ctx:
+        for k in range(num_samples):
+            t0 = time.time()
+            y = model.generate(x, max_new_tokens, temperature=0.8, top_k=200)
+            
+            if device_type == 'cuda':
+                torch.cuda.synchronize()
+            t1 = time.time()
+            
+            dt = t1 - t0
+            generate_times.append(dt)
+            print(f"{k+1}/{num_samples} time: {dt:.3f}s")
+
+# stats
+mean_time = sum(generate_times) / len(generate_times)
+std_time = (sum((t - mean_time) ** 2 for t in generate_times) / len(generate_times)) ** 0.5
+time_per_token = mean_time / max_new_tokens
+tokens_per_sec = max_new_tokens / mean_time
+
+print(f"Mean latency time: {mean_time:.3f} s ({mean_time * 1000:.2f} ms)")
+print(f"Standard deviation: {std_time:.3f} s ({std_time * 1000:.2f} ms)")
+print(f"Time per token: {time_per_token * 1000:.2f} ms")
+print(f"Throughput: {tokens_per_sec:.2f} tokens/s")
+
+# dump for summarize.py
+bench_metrics = {
+    "inference_latency_mean_s": mean_time,
+    "inference_latency_std_s": std_time,
+    "inference_time_per_token_ms": time_per_token * 1000,
+    "inference_tokens_per_sec": tokens_per_sec,
+    "inference_max_new_tokens": max_new_tokens
+}
+
+bench_out_path = os.path.join(out_dir, 'benchmark.json')
+with open(bench_out_path, 'w', encoding='utf-8') as f:
+    json.dump(bench_metrics, f, indent=4)
