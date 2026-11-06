@@ -274,9 +274,13 @@ def collect_rng_states(ddp: bool) -> list[dict[str, Any]]:
 
 def save_checkpoint(path: str, checkpoint: dict[str, Any]) -> None:
     tmp = path + '.tmp'
-    torch.save(checkpoint, tmp)
-    os.replace(tmp, path)
 
+    try:
+        torch.save(checkpoint, tmp)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 def new_timing() -> dict[str, float]:
     return {
