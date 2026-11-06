@@ -13,11 +13,13 @@ Fluxo de Funcionamento:
 - Loop de treino: Computa o decaimento cosseno da taxa de aprendizado, propaga 
   os micro-lotes acumulando gradientes (mixed precision via GradScaler), aplica 
   clipping e atualiza os parâmetros.
-- Avaliação e registro (Logging): Periodicamente avalia as perdas de validação e 
-  treino sem impactar os gradientes, salva checkpoints e exporta estatísticas vitais 
-  para um CSV de métricas em tempo real (throughput, step time, MFU).
-- Finalização: Concluído o limite de orçamento (max_iters), gera e grava um 
-  summary.json consolidando o custo computacional e os resultados finais.
+- Avaliação e registro (Logging): Periodicamente avalia subconjuntos fixos de treino
+  e validação, salva checkpoints e registra perdas, perplexidade, throughput, tempo
+  por passo e MFU no CSV de métricas.
+- Avaliação final: Ao concluir max_iters, avalia todas as janelas de validação
+  reservadas, separadamente do subconjunto usado no monitoramento periódico.
+- Finalização: Gera summary.json com métricas de treinamento, MFU e resultados
+  separados de monitoramento e avaliação final.
 
 Uma GPU:
   python train.py --block_type seq --seed 1337
@@ -113,13 +115,13 @@ METRIC_COLUMNS = [
     'iter',
     'train_loss',
     'val_loss',
-    'train_ppl',
-    'val_ppl',
     'lr',
     'step_time_ms',
     'tokens_per_s',
     'train_time_s',
     'eval_time_s',
+    'mfu_mean_percent',
+    'val_holdout_ppl',
 ]
 
 class TrainSampler:
@@ -199,21 +201,31 @@ def dataset_vocab_size(data_dir: str) -> int:
 def estimate_loss(model: torch.nn.Module, ctx, monitor: dict[str, tuple[str, np.ndarray]],
                   batch_size: int, block_size: int, device: str,
                   device_type: str) -> dict[str, float]:
-    """Loss média em subconjuntos fixos (sem sorteio) de treino e validação.
+    """Calcula a loss média ponderada em subconjuntos fixos de janelas.
 
-    Coloca o modelo em modo de avaliação e o devolve ao modo de treino.
+    A ponderação pelo tamanho do lote evita dar o mesmo peso ao último lote,
+    caso ele seja menor que os demais. O modo anterior do modelo é restaurado.
     """
     out = {}
+    was_training = model.training
     model.eval()
-    for split, (path, ids) in monitor.items():
-        losses = []
-        for k in range(0, len(ids), batch_size):
-            X, Y = load_windows(path, ids[k:k + batch_size], block_size, device, device_type)
-            with ctx:
-                _, loss = model(X, Y)
-            losses.append(loss.item())
-        out[split] = float(np.mean(losses))
-    model.train()
+    try:
+        for split, (path, ids) in monitor.items():
+            total_loss = 0.0
+            total_windows = 0
+            for k in range(0, len(ids), batch_size):
+                batch_ids = ids[k:k + batch_size]
+                X, Y = load_windows(path, batch_ids, block_size, device, device_type)
+                with ctx:
+                    _, loss = model(X, Y)
+                batch_windows = len(batch_ids)
+                total_loss += loss.item() * batch_windows
+                total_windows += batch_windows
+            if total_windows == 0:
+                raise ValueError(f"O subconjunto '{split}' não contém janelas para avaliação.")
+            out[split] = total_loss / total_windows
+    finally:
+        model.train(was_training)
     return out
   
 def get_lr(it: int, warmup_iters: int, lr_decay_iters: int, learning_rate: float,
@@ -274,6 +286,9 @@ def new_timing() -> dict[str, float]:
         'steady_sq_s': 0.0,
         'steady_iters': 0,
         'eval_time_s': 0.0,
+        'mfu_sum': 0.0,
+        'mfu_sq_sum': 0.0,
+        'mfu_count': 0,
     }
 
 
@@ -314,6 +329,17 @@ def evaluate_and_save_checkpoint(
         t_eval = time.perf_counter()
         losses = estimate_loss(raw_model, ctx, rt.monitor, cfg.batch_size,
                                cfg.block_size, rt.device, rt.device_type)
+
+        # A avaliação independente é executada apenas ao finalizar o orçamento
+        # ou em eval_only; ela não participa do monitoramento periódico.
+        final_evaluation = iter_num >= cfg.max_iters or cfg.eval_only
+        if final_evaluation:
+            holdout_losses = estimate_loss(
+                raw_model, ctx, {'val_holdout': rt.val_holdout}, cfg.batch_size,
+                cfg.block_size, rt.device, rt.device_type
+            )
+            losses.update(holdout_losses)
+
         sync(rt.device_type)
         timing['eval_time_s'] += time.perf_counter() - t_eval
 
@@ -323,9 +349,23 @@ def evaluate_and_save_checkpoint(
         else:
             step_ms, tok_s = float('nan'), float('nan')
 
-        print(f"step {iter_num}: train loss {losses['train']:.4f} | "
-              f"val loss {losses['val']:.4f} | val ppl {math.exp(losses['val']):.2f} | "
-              f"passo {step_ms:.1f} ms | {tok_s:,.0f} tok/s")
+        if 'val_holdout' in losses:
+            print(f"step {iter_num}: train loss {losses['train']:.4f} | "
+                  f"val monitor loss {losses['val']:.4f} | "
+                  f"val holdout loss {losses['val_holdout']:.4f} | "
+                  f"val holdout ppl {math.exp(losses['val_holdout']):.2f} | "
+                  f"passo {step_ms:.1f} ms | {tok_s:,.0f} tok/s")
+        else:
+            print(f"step {iter_num}: train loss {losses['train']:.4f} | "
+                  f"val loss {losses['val']:.4f} | val ppl {math.exp(losses['val']):.2f} | "
+                  f"passo {step_ms:.1f} ms | {tok_s:,.0f} tok/s")
+
+        mfu_count = int(timing.get('mfu_count', 0))
+        mfu_mean_percent = (
+            100.0 * timing['mfu_sum'] / mfu_count if mfu_count > 0 else ''
+        )
+        holdout_loss = losses.get('val_holdout')
+        holdout_ppl = math.exp(holdout_loss) if holdout_loss is not None else ''
 
         if not cfg.eval_only:
             with open(rt.metrics_file, 'a', newline='') as f:
@@ -333,13 +373,13 @@ def evaluate_and_save_checkpoint(
                     iter_num,
                     f"{losses['train']:.4f}",
                     f"{losses['val']:.4f}",
-                    f"{math.exp(losses['train']):.2f}",
-                    f"{math.exp(losses['val']):.2f}",
                     f"{lr:.6e}",
                     f"{step_ms:.2f}",
                     f"{tok_s:.0f}",
                     f"{timing['train_time_s']:.2f}",
                     f"{timing['eval_time_s']:.2f}",
+                    f"{mfu_mean_percent:.4f}" if mfu_mean_percent != '' else '',
+                    f"{holdout_ppl:.2f}" if holdout_ppl != '' else '',
                 ])
 
         if iter_num > 0 and not cfg.eval_only:
@@ -350,7 +390,9 @@ def evaluate_and_save_checkpoint(
                 'model_args': cfg.model_args,
                 'config': cfg.as_dict(),
                 'iter_num': iter_num,
+                'train_loss': losses['train'],
                 'val_loss': losses['val'],
+                'val_holdout_loss': losses.get('val_holdout'),
                 'timing': dict(timing),
                 'rng_states': rng_states,
                 'world_size': rt.world_size,
@@ -359,7 +401,7 @@ def evaluate_and_save_checkpoint(
 
     if rt.ddp:
         dist.barrier()
-        
+
     return losses
 
 
@@ -416,9 +458,15 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtim
         return load_windows(rt.train_path, ids, cfg.block_size, rt.device, rt.device_type)
 
     if rt.master and not cfg.eval_only:
+        # Se o checkpoint já contém todas as perdas da avaliação final, a
+        # retomada em max_iters pode reutilizá-las sem repetir a avaliação.
+        resume_final_losses = getattr(cfg, '_resume_final_losses', None)
+        reevaluates_resume_iter = (
+            (iter_num % cfg.eval_interval == 0 or iter_num == cfg.max_iters)
+            and not (iter_num >= cfg.max_iters and resume_final_losses is not None)
+        )
         prepare_metrics_file(
-            rt.metrics_file, cfg.init_from, iter_num,
-            iter_num % cfg.eval_interval == 0 or iter_num == cfg.max_iters)
+            rt.metrics_file, cfg.init_from, iter_num, reevaluates_resume_iter)
 
     X, Y = (train_batch(iter_num, 0)
             if iter_num < cfg.max_iters and not cfg.eval_only else (None, None))
@@ -431,16 +479,22 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtim
             group['lr'] = lr
 
         stop_here = cfg.stop_iter is not None and iter_num >= cfg.stop_iter
-        if (iter_num % cfg.eval_interval == 0 or iter_num == cfg.max_iters
-                or stop_here or cfg.eval_only):
-            
+        resume_final_losses = getattr(cfg, '_resume_final_losses', None)
+        if (iter_num >= cfg.max_iters and resume_final_losses is not None
+                and not cfg.eval_only):
+            last_losses = dict(resume_final_losses)
+            if rt.master:
+                print("Checkpoint já contém as métricas da avaliação final; "
+                      "reutilizando-as sem repetir a avaliação.")
+        elif (iter_num % cfg.eval_interval == 0 or iter_num == cfg.max_iters
+              or stop_here or cfg.eval_only):
             new_losses = evaluate_and_save_checkpoint(
                 iter_num, raw_model, optimizer, scaler, ctx, cfg, rt, timing, lr,
                 interval_time, interval_iters, tokens_per_iter
             )
             if new_losses is not None:
                 last_losses = new_losses
-                
+
             interval_time, interval_iters = 0.0, 0
 
         if cfg.eval_only or iter_num >= cfg.max_iters or stop_here:
@@ -467,13 +521,21 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtim
         else:
             timing['warmup_time_s'] += dt
 
+        # MFU por GPU, normalizado pelo pico teórico informado em --peak_tflops.
+        # A estimativa é acumulada somente nas iterações estáveis e no processo mestre.
+        if steady and rt.master and rt.device_type == 'cuda':
+            mfu = raw_model.estimate_mfu(cfg.batch_size * micro_per_rank, dt)
+            mfu *= 312.0 / cfg.peak_tflops
+            timing['mfu_sum'] += mfu
+            timing['mfu_sq_sum'] += mfu * mfu
+            timing['mfu_count'] += 1
+            running_mfu = mfu if running_mfu < 0.0 else 0.9 * running_mfu + 0.1 * mfu
+
         if iter_num % cfg.log_interval == 0 and rt.master:
-            if steady:
-                mfu = raw_model.estimate_mfu(cfg.batch_size * micro_per_rank, dt)
-                mfu *= 312.0 / cfg.peak_tflops
-                running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
+            mfu_text = f"{running_mfu * 100:.2f}%" if running_mfu >= 0.0 else "n/a"
+            warmup_text = '' if steady else ' (aquecimento)'
             print(f"iter {iter_num}: loss {lossf:.4f}, tempo {dt * 1000:.2f}ms, "
-                  f"mfu {running_mfu * 100:.2f}%{'' if steady else ' (aquecimento)'}")
+                  f"mfu {mfu_text}{warmup_text}")
 
         iter_num += 1
         local_iter += 1
@@ -615,6 +677,8 @@ def print_and_save_run_header(
         print(f"Tokens planejados: {planned_tokens:,} | "
               f"tokens/parâmetro: {planned_tokens / total_params:.2f}")
         print(f"Janelas de treino: {n_train:,} | épocas planejadas: {planned_epochs:.4f}")
+        print(f"Validação: {cfg.val_monitor_windows:,} janelas de monitoramento | "
+              f"{cfg.val_holdout_windows:,} janelas reservadas para avaliação final")
 
         if not cfg.eval_only:
             run_info = {
@@ -627,6 +691,8 @@ def print_and_save_run_header(
                 'tokens_per_param': planned_tokens / total_params,
                 'train_windows': n_train,
                 'val_windows': n_val,
+                'val_monitor_windows': cfg.val_monitor_windows,
+                'val_holdout_windows': cfg.val_holdout_windows,
                 'world_size': rt.world_size,
                 'environment': environment_info(),
             }
@@ -646,6 +712,16 @@ def save_final_summary(
         var = timing['steady_sq_s'] / n - mean_s ** 2 if n else float('nan')
         std_s = math.sqrt(max(var, 0.0)) if n else float('nan')
         iters_per_epoch = n_train / (cfg.grad_accum * cfg.batch_size)
+        mfu_count = int(timing.get('mfu_count', 0))
+        if mfu_count > 0:
+            mfu_mean = timing['mfu_sum'] / mfu_count
+            mfu_var = max(timing['mfu_sq_sum'] / mfu_count - mfu_mean ** 2, 0.0)
+            mfu_mean_percent = mfu_mean * 100.0
+            mfu_std_percent = math.sqrt(mfu_var) * 100.0
+        else:
+            mfu_mean_percent = None
+            mfu_std_percent = None
+
         summary = {
             'dataset': cfg.dataset,
             'block_type': cfg.block_type,
@@ -656,15 +732,17 @@ def save_final_summary(
             'params_total': total_params,
             'params_non_embedding': non_emb_params,
             'train_time_s': timing['train_time_s'],
-            'warmup_time_s': timing['warmup_time_s'],
-            'eval_time_s': timing['eval_time_s'],
-            'steady_iters': n,
             'step_time_ms_mean': mean_s * 1000,
-            'step_time_ms_std': std_s * 1000,
             'tokens_per_s': tokens_per_iter / mean_s if n else float('nan'),
-            'iters_per_epoch': iters_per_epoch,
-            'time_per_epoch_s': mean_s * iters_per_epoch,
-            'monitor_val_loss_final': last_losses['val'] if last_losses else None,
+            'mfu_mean_percent': mfu_mean_percent,
+            'mfu_std_percent': mfu_std_percent,
+            'mfu_peak_tflops_per_gpu': cfg.peak_tflops,
+            'val_holdout_ppl_final': (
+                math.exp(last_losses['val_holdout'])
+                if last_losses and 'val_holdout' in last_losses else None
+            ),
+            'val_monitor_windows': cfg.val_monitor_windows,
+            'val_holdout_windows': cfg.val_holdout_windows,
             'world_size': rt.world_size,
             'peak_tflops': cfg.peak_tflops,
             'gpu': environment_info().get('gpu_name'),
@@ -725,12 +803,16 @@ def run(cfg: Config, rt: Runtime) -> None:
         raise ValueError(f"Monitoramento ({n_monitor:,} janelas) não deixa janelas de "
                          f"validação ({n_val:,}) para a avaliação final.")
     cfg.val_monitor_windows = n_monitor
+    cfg.val_holdout_windows = n_val - n_monitor
     rt.sampler = TrainSampler(n_train, cfg.seed)
     rt.monitor = {
         'train': (rt.train_path,
                   np.random.default_rng(MONITOR_SEED).choice(n_train, n_monitor, replace=False)),
         'val': (val_path, np.arange(n_monitor)),
     }
+    # Todas as janelas restantes da validação ficam reservadas para a
+    # avaliação final e não são utilizadas no monitoramento periódico.
+    rt.val_holdout = (val_path, np.arange(n_monitor, n_val))
 
     model_args = dict(
         n_layer=cfg.n_layer, n_head=cfg.n_head, n_embd=cfg.n_embd,
@@ -757,6 +839,22 @@ def run(cfg: Config, rt: Runtime) -> None:
         model_args = checkpoint['model_args']
         cfg.start_iter = checkpoint['iter_num']
         timing.update(checkpoint.get('timing', {}))
+
+        # Permite reconstruir summary.json sem repetir a avaliação final caso
+        # a execução tenha sido interrompida depois de salvar o checkpoint final.
+        cfg._resume_final_losses = None
+        if cfg.start_iter >= cfg.max_iters:
+            saved_train_loss = checkpoint.get('train_loss')
+            saved_val_loss = checkpoint.get('val_loss')
+            saved_holdout_loss = checkpoint.get('val_holdout_loss')
+            if (saved_train_loss is not None and saved_val_loss is not None
+                    and saved_holdout_loss is not None):
+                cfg._resume_final_losses = {
+                    'train': saved_train_loss,
+                    'val': saved_val_loss,
+                    'val_holdout': saved_holdout_loss,
+                }
+
         if rt.master:
             print(f"Retomando a partir da iteração {cfg.start_iter}.")
     cfg.model_args = model_args
