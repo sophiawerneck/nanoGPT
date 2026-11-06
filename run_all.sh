@@ -1,26 +1,28 @@
+
 #!/usr/bin/env bash
 # Script principal de execução: dados -> treino de todas as variantes e sementes.
 #
 # Fluxo de funcionamento:
-# - Preparação de dados: Identifica o dataset configurado e aciona o script de 
-#   preparação correspondente (ex: prepare_c4.py).
-# - Orquestração de treino: Itera sobre todas as sementes (SEEDS) e variantes de 
-#   bloco (VARIANTS), executando o pipeline para cada permutação.
-# - Verifica os artefatos no diretório de saída (out/): pula execuções já finalizadas (com summary.json) e retoma automaticamente 
-#   as interrompidas (se ckpt.pt existir usando --init_from resume).
-# - Transita automaticamente entre o uso de uma única GPU 
-#   (python) e multi-GPU via DDP (torchrun) com base na variável NPROC.
-# - Ao finalizar o treino de uma variante, executa a validação final em conjunto retido (evaluate.py) e a medição de 
-#   latência de inferência (benchmark.py).
-# - Agregação (Summarize): Após o término de todas as permutações, processa todos os 
-#   arquivos gerados para criar as tabelas comparativas e gráficos finais (summarize.py).
+# - Preparação de dados: identifica o dataset configurado e aciona o script
+#   de preparação correspondente (ex: prepare_c4.py).
+# - Orquestração de treino: itera sobre todas as sementes (SEEDS) e variantes
+#   de bloco (VARIANTS), executando o pipeline para cada combinação.
+# - Verifica os artefatos no diretório de saída (out/): pula execuções já
+#   finalizadas (com summary.json) e retoma as interrompidas (com ckpt.pt).
+# - Transita automaticamente entre uma GPU (python) e múltiplas GPUs via DDP
+#   (torchrun), com base na variável NPROC.
+# - Após o treinamento, executa o benchmark de latência de inferência
+#   (bench.py).
+# - Agregação (Summarize): processa os arquivos gerados para criar as tabelas
+#   comparativas e os gráficos finais (summarize.py).
 #
 # Variáveis de ambiente (opcionais):
-#   DATASET=c4               c4 (experimento) ou shakespeare_char (teste rápido)
+#   DATASET=c4               c4 (experimento) ou shakespeare_char (teste)
 #   SEEDS="1337 1338 1339"   sementes (padrão: 3)
 #   VARIANTS="seq inv par"   variantes
 #   NPROC=1                  GPUs por execução (usa torchrun se > 1)
 #   TRAIN_ARGS=""            argumentos extras para train.py (ex.: --peak_tflops 989)
+
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -33,12 +35,32 @@ TRAIN_ARGS="${TRAIN_ARGS:-}"
 prepare_data() {
   case "$DATASET" in
     c4)
-      python prepare_c4.py ;;
+      if [[ ! -f data/c4/train.bin ||
+            ( ! -f data/c4/validation.bin &&
+              ! -f data/c4/val.bin ) ]]; then
+        echo "Preparando o C4..."
+        python prepare_c4.py
+      else
+        echo "Dados do C4 já presentes. Pulando preparação."
+      fi
+      ;;
+
     shakespeare_char)
-      [[ -f data/shakespeare_char/train.bin ]] || python data/shakespeare_char/prepare.py ;;
+      if [[ ! -f data/shakespeare_char/train.bin ||
+            ! -f data/shakespeare_char/meta.pkl ||
+            ( ! -f data/shakespeare_char/val.bin &&
+              ! -f data/shakespeare_char/validation.bin ) ]]; then
+        echo "Preparando Shakespeare..."
+        python data/shakespeare_char/prepare.py
+      else
+        echo "Dados de Shakespeare já presentes. Pulando preparação."
+      fi
+      ;;
+
     *)
       echo "DATASET inválido: $DATASET (use c4 ou shakespeare_char)" >&2
-      exit 2 ;;
+      exit 2
+      ;;
   esac
 }
 
@@ -52,18 +74,26 @@ train_and_evaluate() {
   else
     local init="scratch"
     [[ -f "$out/ckpt.pt" ]] && init="resume"
+
     echo ">> Treinando $variant (dataset $DATASET, semente $seed, $init)"
-    
-    local args=(--dataset "$DATASET" --block_type "$variant" --seed "$seed" --init_from "$init")
+
+    local args=(
+      --dataset "$DATASET"
+      --block_type "$variant"
+      --seed "$seed"
+      --init_from "$init"
+      --out_dir "$out"
+    )
+
     if [[ "$NPROC" -gt 1 ]]; then
-      torchrun --standalone --nproc_per_node="$NPROC" train.py "${args[@]}" $TRAIN_ARGS
+      torchrun --standalone --nproc_per_node="$NPROC" \
+        train.py "${args[@]}" $TRAIN_ARGS
     else
       python train.py "${args[@]}" $TRAIN_ARGS
     fi
   fi
 
-  python evaluate.py --out_dir "$out"
-  python benchmark.py --out_dir "$out"
+  python bench.py --out_dir "$out"
 }
 
 summarize_results() {
@@ -71,6 +101,11 @@ summarize_results() {
 }
 
 main() {
+  if ! [[ "$NPROC" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NPROC deve ser um inteiro positivo." >&2
+    exit 2
+  fi
+
   prepare_data
 
   for seed in $SEEDS; do
