@@ -388,17 +388,17 @@ def evaluate_and_save_checkpoint(
 
         if iter_num > 0 and not cfg.eval_only:
             save_checkpoint(rt.checkpoint_path, {
-                'model': raw_model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scaler': scaler.state_dict(),
+                'model': raw_model.state_dict(), # pesos do modelo
+                'optimizer': optimizer.state_dict(), # estado do adamw 
+                'scaler': scaler.state_dict(), # estado do grandscalar (só é ativado quando fp16; ele multiplica a loss por um fator de escala dinamico antes do backpropagation -> evitar underflow num)
                 'model_args': cfg.model_args,
                 'config': cfg.as_dict(),
-                'iter_num': iter_num,
+                'iter_num': iter_num, # em qual iteração o checkpoint foi salvo
                 'train_loss': losses['train'],
                 'val_loss': losses['val'],
                 'val_holdout_loss': losses.get('val_holdout'),
-                'timing': dict(timing),
-                'rng_states': rng_states,
+                'timing': dict(timing), # informações de desempenho
+                'rng_states': rng_states, # estados dos geradores aleatórios
                 'world_size': rt.world_size,
             })
             print(f"Checkpoint salvo em {rt.checkpoint_path}")
