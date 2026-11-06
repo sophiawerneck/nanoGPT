@@ -175,6 +175,21 @@ def data_fingerprint(paths: list[str]) -> dict[str, dict[str, Any]]:
         fp[name] = {'bytes': os.path.getsize(path), 'sha256': sha}
     return fp
 
+def find_val_file(data_dir: str) -> str:
+    for name in ('validation.bin', 'val.bin'):
+        path = os.path.join(data_dir, name)
+        if os.path.exists(path):
+            return path
+    return os.path.join(data_dir, 'validation.bin')
+
+
+def dataset_vocab_size(data_dir: str) -> int:
+    meta_path = os.path.join(data_dir, 'meta.pkl')
+    if os.path.exists(meta_path):
+        with open(meta_path, 'rb') as f:
+            return int(pickle.load(f)['vocab_size'])
+    return GPT2_PADDED_VOCAB
+
 @torch.no_grad()
 def estimate_loss(model: torch.nn.Module, ctx, monitor: dict[str, tuple[str, np.ndarray]],
                   batch_size: int, block_size: int, device: str,
