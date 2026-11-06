@@ -31,72 +31,76 @@ import argparse
 import hashlib
 import itertools
 from collections import deque
+from dataclasses import dataclass, field
 
 import numpy as np
 
 from common import TOKEN_DTYPE, write_json, read_json
 
-DATASET_NAME = "allenai/c4"
-DATASET_CONFIG = "en"
-TOKENIZER_NAME = "gpt2"
 
-SPLIT_LIMITS = {
-    "train": 3_000_000_000,
-    "validation": 100_000_000,
-}
+@dataclass
+class C4Config:
+    dataset_name: str = "allenai/c4"
+    dataset_config: str = "en"
+    tokenizer_name: str = "gpt2"
+    split_limits: dict = field(default_factory=lambda: {
+        "train": 3_000_000_000,
+        "validation": 100_000_000,
+    })
+    shuffle_seed: int = 42
+    shuffle_buffer: int = 10_000
+    doc_batch: int = 1024
+    flush_tokens: int = 10_000_000
+    resume_check_docs: int = 100
+    base_dir: str = field(default_factory=lambda: os.path.dirname(os.path.abspath(__file__)))
+    output_dir: str = field(init=False)
 
-SHUFFLE_SEED = 42
-SHUFFLE_BUFFER = 10_000
-DOC_BATCH = 1024             
-FLUSH_TOKENS = 10_000_000 # tokens gravados entre pontos de retomada
-RESUME_CHECK_DOCS = 100 # documentos recomparados com o stream na retomada
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(BASE_DIR, "data", "c4")
+    def __post_init__(self):
+        self.output_dir = os.path.join(self.base_dir, "data", "c4")
 
 
 class ResumeError(RuntimeError):
     pass
 
 
-def get_encoder():
+def get_encoder(cfg: C4Config):
     import tiktoken
-    enc = tiktoken.get_encoding(TOKENIZER_NAME)
+    enc = tiktoken.get_encoding(cfg.tokenizer_name)
     assert enc.n_vocab <= np.iinfo(TOKEN_DTYPE).max + 1, "vocabulário não cabe em uint16"
     return enc
 
 
-def resolve_revision():
+def resolve_revision(cfg: C4Config):
     """Commit atual do dataset no Hub, para fixar a versão usada."""
     from huggingface_hub import HfApi
-    return HfApi().dataset_info(DATASET_NAME).sha
+    return HfApi().dataset_info(cfg.dataset_name).sha
 
 
-def stream_texts(split, revision, shuffle=True):
+def stream_texts(cfg: C4Config, split, revision, shuffle=True):
     """Fluxo determinístico de textos: mesmo commit + mesma semente -> mesma ordem."""
     from datasets import load_dataset
 
-    ds = load_dataset(DATASET_NAME, DATASET_CONFIG, split=split,
+    ds = load_dataset(cfg.dataset_name, cfg.dataset_config, split=split,
                       streaming=True, revision=revision)
     if shuffle:
-        ds = ds.shuffle(seed=SHUFFLE_SEED, buffer_size=SHUFFLE_BUFFER)
+        ds = ds.shuffle(seed=cfg.shuffle_seed, buffer_size=cfg.shuffle_buffer)
     for example in ds:
         yield example["text"]
 
 
-def split_config(enc, split, max_tokens, revision):
+def split_config(cfg: C4Config, enc, split, max_tokens, revision):
     """Tudo o que determina o conteúdo do .bin. Deve ser idêntico na retomada."""
     return {
-        "dataset": DATASET_NAME,
-        "config": DATASET_CONFIG,
+        "dataset": cfg.dataset_name,
+        "config": cfg.dataset_config,
         "revision": revision,
         "split": split,
-        "tokenizer": TOKENIZER_NAME,
+        "tokenizer": cfg.tokenizer_name,
         "n_vocab": enc.n_vocab,
         "eot_token": enc.eot_token,
         "dtype": np.dtype(TOKEN_DTYPE).name,
-        "shuffle_seed": SHUFFLE_SEED,
-        "shuffle_buffer": SHUFFLE_BUFFER,
+        "shuffle_seed": cfg.shuffle_seed,
+        "shuffle_buffer": cfg.shuffle_buffer,
         "max_tokens": max_tokens,
     }
 
@@ -111,11 +115,11 @@ def library_versions():
     return versions
 
 
-def iter_document_tokens(enc, texts, num_threads):
+def iter_document_tokens(cfg: C4Config, enc, texts, num_threads):
     """Tokeniza documentos em lotes (multithread) e anexa EOT a cada um."""
     texts = iter(texts)
     while True:
-        batch = list(itertools.islice(texts, DOC_BATCH))
+        batch = list(itertools.islice(texts, cfg.doc_batch))
         if not batch:
             return
         for tokens in enc.encode_ordinary_batch(batch, num_threads=num_threads):
@@ -133,7 +137,8 @@ def file_sha256(path, chunk_bytes=64 * 1024 * 1024):
             h.update(block)
     return h.hexdigest()
 
-def sanity_check(enc, texts, num_threads):
+
+def sanity_check(cfg: C4Config, enc, texts, num_threads):
     texts = list(texts)
     eot = enc.eot_token
     batch_tokens = enc.encode_ordinary_batch(texts, num_threads=num_threads)
@@ -147,7 +152,7 @@ def sanity_check(enc, texts, num_threads):
         if enc.decode(tokens) != text:
             errors.append(f"doc {i}: decode(encode(texto)) != texto")
 
-    packed = [t for doc in iter_document_tokens(enc, texts, num_threads) for t in doc]
+    packed = [t for doc in iter_document_tokens(cfg, enc, texts, num_threads) for t in doc]
     packed = np.asarray(packed, dtype=np.int64)
     boundaries = np.flatnonzero(packed == eot)
     if len(boundaries) != len(texts):
@@ -169,6 +174,7 @@ def sanity_check(enc, texts, num_threads):
     print(f"Teste de sanidade OK: {len(texts):,} documentos, {len(packed):,} tokens "
           f"(lote = sequencial, ida-e-volta exata, sem EOT interno, empacotamento reversível).")
 
+
 def last_documents_on_disk(bin_path, num_tokens, k):
     """Tokens dos últimos k documentos gravados (cada um sem o EOT final)."""
     data = np.memmap(bin_path, dtype=TOKEN_DTYPE, mode="r")[:num_tokens]
@@ -177,24 +183,22 @@ def last_documents_on_disk(bin_path, num_tokens, k):
     while True:
         tail = np.asarray(data[max(0, num_tokens - window):], dtype=np.int64)
         if eot is None:
-            eot = int(tail[-1])  # todo arquivo gravado termina em EOT
+            eot = int(tail[-1])
         ends = np.flatnonzero(tail == eot)
         if len(ends) > k or window >= num_tokens:
             break
         window *= 4
     starts = np.concatenate(([0], ends[:-1] + 1))
-    # Se a janela não começa no início do arquivo, o primeiro segmento pode
-    # estar cortado: só os segmentos depois do primeiro EOT são confiáveis.
     usable = list(zip(starts, ends))
     if window < num_tokens:
         usable = usable[1:]
     return [tail[s:e].tolist() for s, e in usable[-k:]]
 
 
-def resume_iterator(enc, texts_factory, docs_done, bin_path, tokens_done, num_threads):
+def resume_iterator(cfg: C4Config, enc, texts_factory, docs_done, bin_path, tokens_done, num_threads):
     """Avança o stream até docs_done, recomparando os últimos documentos com o
     que está no disco. Retorna o iterador posicionado no próximo documento."""
-    k = min(RESUME_CHECK_DOCS, docs_done)
+    k = min(cfg.resume_check_docs, docs_done)
     texts = texts_factory()
     if k == 0:
         return texts
@@ -212,21 +216,22 @@ def resume_iterator(enc, texts_factory, docs_done, bin_path, tokens_done, num_th
     print(f"  retomada verificada: últimos {k} documentos idênticos ao stream.")
     return texts
 
-def prepare_split(enc, split, max_tokens, texts_factory, num_threads, revision, resume=True):
-    bin_path = os.path.join(OUTPUT_DIR, f"{split}.bin")
-    state_path = os.path.join(OUTPUT_DIR, f"{split}.state.json")
-    meta_path = os.path.join(OUTPUT_DIR, f"{split}_meta.json")
+
+def prepare_split(cfg: C4Config, enc, split, max_tokens, texts_factory, num_threads, revision, resume=True):
+    bin_path = os.path.join(cfg.output_dir, f"{split}.bin")
+    state_path = os.path.join(cfg.output_dir, f"{split}.state.json")
+    meta_path = os.path.join(cfg.output_dir, f"{split}_meta.json")
     itemsize = np.dtype(TOKEN_DTYPE).itemsize
-    config = split_config(enc, split, max_tokens, revision)
+    config_dict = split_config(cfg, enc, split, max_tokens, revision)
 
     docs, tokens = 0, 0
     mode = "wb"
     if resume and os.path.exists(state_path) and os.path.exists(bin_path):
         state = read_json(state_path)
         saved = state.get("config")
-        if saved != config:
-            diffs = sorted(k for k in set(config) | set(saved or {})
-                           if (saved or {}).get(k) != config.get(k))
+        if saved != config_dict:
+            diffs = sorted(k for k in set(config_dict) | set(saved or {})
+                           if (saved or {}).get(k) != config_dict.get(k))
             raise ResumeError(
                 f"{split}: configuração diferente da execução anterior ({diffs}). "
                 "Rode com --no_resume para recomeçar."
@@ -249,14 +254,13 @@ def prepare_split(enc, split, max_tokens, texts_factory, num_threads, revision, 
 
     def state_record(complete):
         return {"docs": docs, "tokens": tokens, "complete": complete,
-                "config": config, "library_versions": library_versions()}
+                "config": config_dict, "library_versions": library_versions()}
 
     with open(bin_path, mode) as f:
         if mode == "r+b":
-            # Descarta qualquer escrita parcial posterior ao último ponto salvo.
             f.truncate(tokens * itemsize)
             f.seek(0, os.SEEK_END)
-            texts = resume_iterator(enc, texts_factory, docs, bin_path, tokens, num_threads)
+            texts = resume_iterator(cfg, enc, texts_factory, docs, bin_path, tokens, num_threads)
         else:
             texts = texts_factory()
             write_json(state_path, state_record(False))
@@ -268,11 +272,9 @@ def prepare_split(enc, split, max_tokens, texts_factory, num_threads, revision, 
                 f.flush()
                 os.fsync(f.fileno())
                 buffer, buffered = [], 0
-            # O estado só é atualizado depois que os tokens estão no disco.
             write_json(state_path, state_record(False))
 
-        for doc_tokens in iter_document_tokens(enc, texts, num_threads):
-            # Corte na fronteira de documento: nenhum documento é truncado.
+        for doc_tokens in iter_document_tokens(cfg, enc, texts, num_threads):
             if tokens + len(doc_tokens) > max_tokens:
                 stop_reason = "limite_de_tokens"
                 break
@@ -280,7 +282,7 @@ def prepare_split(enc, split, max_tokens, texts_factory, num_threads, revision, 
             buffered += len(doc_tokens)
             tokens += len(doc_tokens)
             docs += 1
-            if buffered >= FLUSH_TOKENS:
+            if buffered >= cfg.flush_tokens:
                 flush()
                 print(f"  {split}: {tokens:,} tokens / {docs:,} documentos", flush=True)
 
@@ -289,7 +291,7 @@ def prepare_split(enc, split, max_tokens, texts_factory, num_threads, revision, 
     if stop_reason == "fim_do_stream" and tokens < max_tokens:
         print(f"Aviso: o stream de '{split}' terminou antes do limite ({tokens:,} < {max_tokens:,}).")
 
-    meta = dict(config)
+    meta = dict(config_dict)
     meta.update({
         "num_tokens": tokens,
         "num_documents": docs,
@@ -305,15 +307,15 @@ def prepare_split(enc, split, max_tokens, texts_factory, num_threads, revision, 
     return meta
 
 
-def verify_split(enc, split, texts_factory, num_docs=200):
+def verify_split(cfg: C4Config, enc, split, texts_factory, num_docs=200):
     """Confere o arquivo gravado:
     - tamanho igual aos metadados e término em EOT;
     - número de EOTs igual ao número de documentos (estrutura do arquivo todo);
     - reconstrução exata dos primeiros documentos a partir do stream;
     - SHA-256 do arquivo inteiro, gravado nos metadados (ou conferido, se já existir).
     """
-    bin_path = os.path.join(OUTPUT_DIR, f"{split}.bin")
-    meta_path = os.path.join(OUTPUT_DIR, f"{split}_meta.json")
+    bin_path = os.path.join(cfg.output_dir, f"{split}.bin")
+    meta_path = os.path.join(cfg.output_dir, f"{split}_meta.json")
     meta = read_json(meta_path)
     data = np.memmap(bin_path, dtype=TOKEN_DTYPE, mode="r")
     eot = enc.eot_token
@@ -350,8 +352,10 @@ def verify_split(enc, split, texts_factory, num_docs=200):
 
 
 def main():
+    cfg = C4Config()
+    
     parser = argparse.ArgumentParser(description="Preparação do C4 (en) com tokenizador GPT-2")
-    parser.add_argument("--splits", nargs="+", default=list(SPLIT_LIMITS), choices=list(SPLIT_LIMITS))
+    parser.add_argument("--splits", nargs="+", default=list(cfg.split_limits), choices=list(cfg.split_limits))
     parser.add_argument("--num_threads", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--no_resume", action="store_true")
     parser.add_argument("--skip_sanity", action="store_true")
@@ -362,16 +366,15 @@ def main():
                              "ou o atual na primeira execução)")
     args = parser.parse_args()
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    enc = get_encoder()
-    print(f"Tokenizador: {TOKENIZER_NAME} | vocabulário: {enc.n_vocab:,} | EOT: {enc.eot_token}")
+    os.makedirs(cfg.output_dir, exist_ok=True)
+    enc = get_encoder(cfg)
+    print(f"Tokenizador: {cfg.tokenizer_name} | vocabulário: {enc.n_vocab:,} | EOT: {enc.eot_token}")
 
-    # Mesma revisão para todos os splits: a já registrada, a informada ou a atual.
     revision = args.revision
     if revision is None and not args.no_resume:
         for split in args.splits:
             for name in (f"{split}.state.json", f"{split}_meta.json"):
-                path = os.path.join(OUTPUT_DIR, name)
+                path = os.path.join(cfg.output_dir, name)
                 if os.path.exists(path):
                     saved = read_json(path)
                     revision = (saved.get("config") or saved).get("revision")
@@ -380,22 +383,22 @@ def main():
             if revision:
                 break
     if revision is None:
-        revision = resolve_revision()
-    print(f"Dataset: {DATASET_NAME}/{DATASET_CONFIG} @ {revision}")
+        revision = resolve_revision(cfg)
+    print(f"Dataset: {cfg.dataset_name}/{cfg.dataset_config} @ {revision}")
     print(f"Threads de tokenização: {args.num_threads}")
 
     if not args.skip_sanity and not args.verify_only:
         print("Teste de sanidade (1.000 documentos de treino)...")
-        sanity_check(enc, itertools.islice(stream_texts("train", revision, shuffle=False), 1000),
+        sanity_check(cfg, enc, itertools.islice(stream_texts(cfg, "train", revision, shuffle=False), 1000),
                      args.num_threads)
 
     for split in args.splits:
-        factory = lambda s=split: stream_texts(s, revision, shuffle=True)
+        factory = lambda s=split: stream_texts(cfg, s, revision, shuffle=True)
         if not args.verify_only:
             print(f"\nPreparando {split}...")
-            prepare_split(enc, split, SPLIT_LIMITS[split], factory,
+            prepare_split(cfg, enc, split, cfg.split_limits[split], factory,
                           args.num_threads, revision, resume=not args.no_resume)
-        verify_split(enc, split, factory, num_docs=args.verify_docs)
+        verify_split(cfg, enc, split, factory, num_docs=args.verify_docs)
 
     print("\nPreparação do C4 concluída.")
 
