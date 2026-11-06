@@ -46,7 +46,26 @@ Todos os resultados do relatório são reproduzidos por um único comando, que e
 ```bash
 bash run_all.sh
 ```
-Por padrão, ele treina as 3 variantes (seq, inv, par) com 3 sementes cada (1337, 1338, 1339), o que leva cerca de 8 h por execução numa A100 (~72 GPU-horas no total). O script pode ser executado de novo após uma interrupção: ele pula as etapas concluídas e retoma as interrompidas. Variações:
+Por padrão, o experimento treina as três variantes ("seq", "inv" e "par") com três sementes cada (1337, 1338 e 1339), totalizando nove execuções.
+
+Em uma GPU NVIDIA A100, estima-se aproximadamente 8 horas por execução, totalizando cerca de 72 GPU-horas. No Google Colab com NVIDIA T4, o tempo de execução será consideravelmente maior, podendo chegar a dezenas de horas por treinamento. O tempo efetivo depende das condições de execução e da disponibilidade dos recursos computacionais.
+
+O script pode ser executado novamente após uma interrupção, retomando os treinamentos a partir dos checkpoints disponíveis e ignorando as etapas já concluídas. Variações:
+
+Variações de execução
+```bash
+SEEDS="1337" bash run_all.sh
+# Executa apenas uma semente.
+
+NPROC=1 bash run_all.sh
+# Utiliza uma GPU por execução (DDP), quando disponível.
+
+TRAIN_ARGS="--peak_tflops 65" bash run_all.sh
+# Define o pico teórico de 65 TFLOPS para NVIDIA T4 em FP16.
+```
+Para utilizar outra GPU, ajuste "--peak_tflops" conforme o modelo e a precisão numérica utilizados.
+Para utilizar múltiplas GPUs, ajuste `NPROC` conforme a quantidade de GPUs disponíveis.
+
 
 ### Preparação dos dados
 ```bash
