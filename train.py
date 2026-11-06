@@ -58,6 +58,34 @@ from common import (
     strip_compile_prefix, count_params, environment_info, write_json, read_json,
 )
 
+# Datasets suportados. Cada um define seus próprios padrões; qualquer argumento
+# passado explicitamente na linha de comando tem precedência.
+#   c4               experimento do relatório (padrões do parser, GPT-3 Small)
+#   shakespeare_char depuração rápida, gerado por data/shakespeare_char/prepare.py
+#                    (configuração de config/train_shakespeare_char.py do nanoGPT)
+DATASET_PRESETS: dict[str, dict[str, Any]] = {
+    'c4': {},
+    'shakespeare_char': dict(
+        n_layer=6, n_head=6, n_embd=384, dropout=0.2,
+        block_size=256, batch_size=64, grad_accum=1,
+        learning_rate=1e-3, min_lr=1e-4, beta2=0.99,
+        max_iters=5000, lr_decay_iters=5000, warmup_iters=100,
+        eval_interval=250, log_interval=10,
+        # A validação tem só 435 janelas de 256 tokens: o monitoramento usa
+        # 4 x 64 = 256 delas e deixa as demais para a avaliação final.
+        eval_iters=4,
+        # ~1M tokens: o treino percorre o conjunto ~80 vezes, como no nanoGPT.
+        allow_multi_epoch=True,
+    ),
+}
+DATASET_HINTS = {
+    'c4': 'python prepare_c4.py',
+    'shakespeare_char': 'python data/shakespeare_char/prepare.py',
+}
+
+GPT2_PADDED_VOCAB = 50304   # 50.257 do GPT-2 arredondado para múltiplo de 64 (nanoGPT)
+SMALL_FILE_BYTES = 512 * 1024 * 1024   # até aqui o SHA-256 é calculado na hora
+
 # Semente fixa dos subconjuntos de monitoramento: igual para todas as
 # variantes e sementes, para que as curvas sejam comparáveis.
 MONITOR_SEED = 12345
@@ -68,8 +96,12 @@ RESUME_LOCKED_KEYS = [
     'batch_size', 'block_size', 'grad_accum', 'learning_rate', 'min_lr',
     'max_iters', 'lr_decay_iters', 'warmup_iters', 'weight_decay', 'beta1',
     'beta2', 'grad_clip', 'decay_lr', 'seed', 'eval_iters', 'eval_interval',
+    # arquitetura e regularização
     'block_type', 'n_layer', 'n_head', 'n_embd', 'bias', 'dropout',
-    'dtype', 'data_fingerprint',
+    # precisão numérica
+    'dtype',
+    # identidade dos dados (dataset, tamanho e SHA-256 dos .bin)
+    'dataset', 'data_fingerprint',
 ]
 
 METRIC_COLUMNS = [
@@ -126,21 +158,22 @@ def global_micro_batch(it: int, micro: int, rank: int, micro_per_rank: int, worl
     """
     return it * micro_per_rank * world_size + micro * world_size + rank
 
-
 def data_fingerprint(paths: list[str]) -> dict[str, dict[str, Any]]:
     """Identidade dos arquivos de dados: tamanho em bytes e SHA-256.
 
-    O SHA-256 vem dos metadados gravados por prepare_c4.py (que o confere
-    contra o arquivo com --verify_only); o tamanho é sempre lido do disco.
+    Para o C4, o SHA-256 vem dos metadados de prepare_c4.py (calcular o hash
+    de 6 GB a cada execução seria lento). Para datasets sem esses metadados,
+    como o Tiny Shakespeare, o hash é calculado na hora.
     """
     fp = {}
     for path in paths:
         name = os.path.basename(path)
         meta_path = os.path.join(os.path.dirname(path), name.replace('.bin', '_meta.json'))
         sha = read_json(meta_path).get('sha256') if os.path.exists(meta_path) else None
+        if sha is None and os.path.getsize(path) <= SMALL_FILE_BYTES:
+            sha = file_sha256(path)
         fp[name] = {'bytes': os.path.getsize(path), 'sha256': sha}
     return fp
-
 
 @torch.no_grad()
 def estimate_loss(model: torch.nn.Module, ctx, monitor: dict[str, tuple[str, np.ndarray]],
@@ -162,9 +195,7 @@ def estimate_loss(model: torch.nn.Module, ctx, monitor: dict[str, tuple[str, np.
         out[split] = float(np.mean(losses))
     model.train()
     return out
-
-
-
+  
 def get_lr(it: int, warmup_iters: int, lr_decay_iters: int, learning_rate: float,
            min_lr: float) -> float:
     """Aquecimento linear seguido de decaimento cosseno até min_lr."""
@@ -506,11 +537,17 @@ class Runtime:
 
 def main() -> None:
     parser = build_parser()
+    # Primeiro descobre o dataset, depois aplica os padrões dele; argumentos
+    # explícitos na linha de comando tem precedência.
+    pre, _ = parser.parse_known_args()
+    parser.set_defaults(**DATASET_PRESETS[pre.dataset])
     args = parser.parse_args()
     validate_args(parser, args)
     cfg = Config(args)
+    if cfg.data_dir is None:
+        cfg.data_dir = os.path.join(BASE_DIR, 'data', cfg.dataset)
     if cfg.out_dir is None:
-        cfg.out_dir = os.path.join(BASE_DIR, 'out', f'{cfg.block_type}_s{cfg.seed}')
+        cfg.out_dir = os.path.join(BASE_DIR, 'out', cfg.dataset, f'{cfg.block_type}_s{cfg.seed}')
 
     rt = Runtime()
     rt.ddp = int(os.environ.get('RANK', -1)) != -1
@@ -520,7 +557,7 @@ def main() -> None:
     try:
         run(cfg, rt)
     finally:
-        
+        # Encerra o grupo de processos mesmo se o treino falhar (recomendação da documentação de torch.distributed).
         if rt.ddp and dist.is_initialized():
             destroy_process_group()
 
