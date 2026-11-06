@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
 # Script principal de execução: dados -> treino de todas as variantes e sementes.
-# Idempotente: execuções concluídas são puladas e as interrompidas são retomadas.
 #
-# As etapas de avaliação, benchmark e agregação rodam
-# em sequência:
-#   evaluate.py  --out_dir <execução>   -> perda/perplexidade final
-#   benchmark.py --out_dir <execução>   -> latência de inferência
-#   summarize.py --out_root <pasta>     -> tabelas e speedup
+# Fluxo de funcionamento:
+# - Preparação de dados: Identifica o dataset configurado e aciona o script de 
+#   preparação correspondente (ex: prepare_c4.py).
+# - Orquestração de treino: Itera sobre todas as sementes (SEEDS) e variantes de 
+#   bloco (VARIANTS), executando o pipeline para cada permutação.
+# - Verifica os artefatos no diretório de saída (out/): pula execuções já finalizadas (com summary.json) e retoma automaticamente 
+#   as interrompidas (se ckpt.pt existir usando --init_from resume).
+# - Transita automaticamente entre o uso de uma única GPU 
+#   (python) e multi-GPU via DDP (torchrun) com base na variável NPROC.
+# - Ao finalizar o treino de uma variante, executa a validação final em conjunto retido (evaluate.py) e a medição de 
+#   latência de inferência (benchmark.py).
+# - Agregação (Summarize): Após o término de todas as permutações, processa todos os 
+#   arquivos gerados para criar as tabelas comparativas e gráficos finais (summarize.py).
 #
 # Variáveis de ambiente (opcionais):
 #   DATASET=c4               c4 (experimento) ou shakespeare_char (teste rápido)
