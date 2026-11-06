@@ -13,8 +13,10 @@ Este trabalho investiga o impacto de rearranjos estruturais das camadas de Aten�
 <!-- Informar os requisitos necessários para executar o projeto. -->
 
 - Python: Python: 3.13
-- GPU NVIDIA com suporte a CUDA. Os experimentos usam bfloat16, disponível a partir da arquitetura Ampere (ex.: A100).
-- ~10 GB de disco para os dados tokenizados e ~1,5 GB por checkpoint.
+- GPU NVIDIA com suporte a CUDA.
+- Precisão numérica: FP16 para NVIDIA T4; BF16 pode ser utilizado em GPUs compatíveis, como A100.
+- Aproximadamente 10 GB de espaço para os dados tokenizados.
+- Espaço adicional para checkpoints, métricas e resultados.
 - Acesso à internet na preparação dos dados, que baixa o C4 do Hugging Face em streaming.
 - Dependências com versões fixadas em requirements.txt.
 
