@@ -12,6 +12,7 @@ import torch
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_DTYPE = np.uint16  
 
+
 def count_tokens(path):
     return os.path.getsize(path) // np.dtype(TOKEN_DTYPE).itemsize
 
@@ -24,6 +25,8 @@ def count_windows(path, block_size):
 def load_windows(path, window_ids, block_size, device, device_type):
     """Carrega as janelas indicadas. A janela w cobre os tokens
     [w*block_size, w*block_size + block_size] (entrada e alvo deslocado)."""
+    # Recria o memmap a cada chamada para evitar o vazamento de memória
+    # documentado no nanoGPT original.
     data = np.memmap(path, dtype=TOKEN_DTYPE, mode='r')
     xs, ys = [], []
     for w in window_ids:
@@ -130,6 +133,8 @@ def write_json(path, obj):
     tmp = path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(obj, f, indent=2, ensure_ascii=False, default=str)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
 
 
