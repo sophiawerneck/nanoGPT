@@ -2,7 +2,7 @@
 # train a miniature character-level shakespeare model
 # good for debugging and playing on macbooks and such
 
-out_dir = 'out-par' # Alterei isso
+out_dir = 'out-par_shared' # Alterei isso
 eval_interval = 250 # keep frequent because we'll overfit
 eval_iters = 200
 log_interval = 10 # don't print too too often
@@ -12,7 +12,7 @@ always_save_checkpoint = False
 
 wandb_log = False # override via command line if you like
 wandb_project = 'shakespeare-char'
-wandb_run_name = 'mini-gpt-par' # Alterei isso
+wandb_run_name = 'mini-gpt-par_shared' # Alterei isso
 
 dataset = 'shakespeare_char'
 gradient_accumulation_steps = 1
@@ -33,7 +33,7 @@ beta2 = 0.99 # make a bit bigger because number of tokens per iter is small
 
 warmup_iters = 100 # not super necessary potentially
 
-block_type = 'par' # Adicionei isso
+block_type = 'par_shared' # Adicionei isso
 
 # on macbook also add
 # device = 'cpu'  # run on cpu only
