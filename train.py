@@ -13,16 +13,29 @@ Escolhas metodológicas:
   beta=(0,9; 0,95), weight decay 0,1, clipping 1,0, decaimento cosseno até 10%.
 - Orçamento de ~3B tokens para ~124M parâmetros (~24 tokens/parâmetro), perto
   do ótimo computacional de ~20 de Hoffmann et al. (NeurIPS 2022).
-- Amostragem SEM reposição: o train.bin é dividido em janelas não sobrepostas
-  de block_size tokens, percorridas numa permutação determinada pela semente.
-  Cada token é visto no máximo uma vez por época (passagem única, como no
-  GPT-3 e no Chinchilla). Mesma semente = mesma ordem de dados em todas as
-  variantes (comparação pareada).
-- Monitoramento em subconjuntos FIXOS de treino e validação; a avaliação final
-  (evaluate.py) usa janelas de validação disjuntas das de monitoramento.
+- Amostragem sem reposição: o train.bin é dividido em janelas não sobrepostas
+  de block_size tokens, e cada janela é sorteada uma única vez por época,
+  numa permutação definida pela semente. Como as janelas não se sobrepõem,
+  cada token aparece como entrada no máximo uma vez por época; os tokens
+  restantes no fim do arquivo (menos de uma janela) não são usados. O
+  orçamento cobre menos de uma época, então não há repetição de dados, o que
+  evita o efeito da repetição sobre a perda (Muennighoff et al., NeurIPS 2023).
+  Mesma semente = mesma ordem de dados em todas as variantes (comparação
+  pareada).
+- Monitoramento em subconjuntos fixos de treino e validação; as janelas de
+  validação a partir de val_monitor_windows ficam reservadas para a avaliação
+  final.
 - Tempo de passo medido com sincronização da GPU, excluindo a avaliação e as
   primeiras iterações de cada processo (compilação e aquecimento).
+
+Reprodutibilidade: a semente, a configuração, as versões e a identidade dos
+dados são registradas, e a retomada reproduz a ordem dos dados exatamente.
+Resultados numéricos bit a bit idênticos não são garantidos entre GPUs,
+plataformas ou versões do PyTorch (ver "Reproducibility" na documentação do
+PyTorch).
 """
+
+from __future__ import annotations
 
 import os
 import time
@@ -31,6 +44,7 @@ import random
 import csv
 import argparse
 from datetime import timedelta
+from typing import Any
 
 import numpy as np
 import torch
@@ -41,18 +55,21 @@ from torch.distributed import init_process_group, destroy_process_group
 from model import GPTConfig, GPT
 from common import (
     BASE_DIR, count_windows, load_windows, default_dtype, autocast_ctx, sync,
-    strip_compile_prefix, count_params, environment_info, write_json,
+    strip_compile_prefix, count_params, environment_info, write_json, read_json,
 )
 
 # Semente fixa dos subconjuntos de monitoramento: igual para todas as
 # variantes e sementes, para que as curvas sejam comparáveis.
 MONITOR_SEED = 12345
 
-# Hiperparâmetros que não podem mudar numa retomada.
+# Configurações que não podem mudar numa retomada: otimização, dados,
+# arquitetura e precisão numérica.
 RESUME_LOCKED_KEYS = [
     'batch_size', 'block_size', 'grad_accum', 'learning_rate', 'min_lr',
     'max_iters', 'lr_decay_iters', 'warmup_iters', 'weight_decay', 'beta1',
     'beta2', 'grad_clip', 'decay_lr', 'seed', 'eval_iters', 'eval_interval',
+    'block_type', 'n_layer', 'n_head', 'n_embd', 'bias', 'dropout',
+    'dtype', 'data_fingerprint',
 ]
 
 METRIC_COLUMNS = [
@@ -63,9 +80,9 @@ METRIC_COLUMNS = [
     'val_ppl',
     'lr',
     'step_time_ms', # média dos passos estáveis desde a última avaliação
-    'tokens_per_s', # throughput de treino no mesmo intervalo (por processo x world_size)
+    'tokens_per_s', # throughput de treino no mesmo intervalo (todos os processos)
     'train_time_s', # tempo acumulado de treino (sem avaliação)
-    'eval_time_s', # tempo acumulado gasto em avaliação
+    'eval_time_s',  # tempo acumulado gasto em avaliação
 ]
 
 class TrainSampler:
@@ -73,23 +90,27 @@ class TrainSampler:
 
     A amostra global de índice s pertence à época s // n e ocupa a posição
     s % n de uma permutação gerada com (seed, época). O lote de qualquer
-    iteração pode ser recalculado a partir de iter_num.
+    iteração pode ser recalculado a partir de iter_num, o que torna a
+    retomada exata sem guardar o estado do carregador.
     """
 
-    def __init__(self, num_windows, seed):
+    def __init__(self, num_windows: int, seed: int) -> None:
+        if num_windows <= 0:
+            raise ValueError("num_windows deve ser positivo")
         self.n = num_windows
         self.seed = seed
         self._epoch = -1
-        self._perm = None
+        self._perm: np.ndarray | None = None
 
-    def _perm_for(self, epoch):
+    def _perm_for(self, epoch: int) -> np.ndarray:
         if epoch != self._epoch:
             rng = np.random.default_rng([self.seed, epoch])
             self._perm = rng.permutation(self.n)
             self._epoch = epoch
         return self._perm
 
-    def ids(self, start, count):
+    def ids(self, start: int, count: int) -> np.ndarray:
+        """Índices das janelas das amostras globais start, ..., start + count - 1."""
         out = np.empty(count, dtype=np.int64)
         for j in range(count):
             epoch, pos = divmod(start + j, self.n)
@@ -97,9 +118,38 @@ class TrainSampler:
         return out
 
 
+def global_micro_batch(it: int, micro: int, rank: int, micro_per_rank: int, world_size: int) -> int:
+    """Índice global do micro-lote (iteração, micro-passo, rank).
+
+    Cada iteração consome micro_per_rank * world_size micro-lotes consecutivos,
+    então o conjunto de dados de uma iteração não depende do número de GPUs.
+    """
+    return it * micro_per_rank * world_size + micro * world_size + rank
+
+
+def data_fingerprint(paths: list[str]) -> dict[str, dict[str, Any]]:
+    """Identidade dos arquivos de dados: tamanho em bytes e SHA-256.
+
+    O SHA-256 vem dos metadados gravados por prepare_c4.py (que o confere
+    contra o arquivo com --verify_only); o tamanho é sempre lido do disco.
+    """
+    fp = {}
+    for path in paths:
+        name = os.path.basename(path)
+        meta_path = os.path.join(os.path.dirname(path), name.replace('.bin', '_meta.json'))
+        sha = read_json(meta_path).get('sha256') if os.path.exists(meta_path) else None
+        fp[name] = {'bytes': os.path.getsize(path), 'sha256': sha}
+    return fp
+
+
 @torch.no_grad()
-def estimate_loss(model, ctx, monitor, batch_size, block_size, device, device_type):
-    """Loss média em subconjuntos fixos (sem sorteio) de treino e validação."""
+def estimate_loss(model: torch.nn.Module, ctx, monitor: dict[str, tuple[str, np.ndarray]],
+                  batch_size: int, block_size: int, device: str,
+                  device_type: str) -> dict[str, float]:
+    """Loss média em subconjuntos fixos (sem sorteio) de treino e validação.
+
+    Coloca o modelo em modo de avaliação e o devolve ao modo de treino.
+    """
     out = {}
     model.eval()
     for split, (path, ids) in monitor.items():
@@ -113,18 +163,21 @@ def estimate_loss(model, ctx, monitor, batch_size, block_size, device, device_ty
     model.train()
     return out
 
-def get_lr(it, warmup_iters, lr_decay_iters, learning_rate, min_lr):
+
+
+def get_lr(it: int, warmup_iters: int, lr_decay_iters: int, learning_rate: float,
+           min_lr: float) -> float:
+    """Aquecimento linear seguido de decaimento cosseno até min_lr."""
     if it < warmup_iters:
         return learning_rate * (it + 1) / (warmup_iters + 1)
     if it > lr_decay_iters:
         return min_lr
     decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (learning_rate - min_lr)
 
 
-def get_rng_state():
+def get_rng_state() -> dict[str, Any]:
     state = {
         'python': random.getstate(),
         'numpy': np.random.get_state(),
@@ -135,7 +188,7 @@ def get_rng_state():
     return state
 
 
-def set_rng_state(state):
+def set_rng_state(state: dict[str, Any]) -> None:
     random.setstate(state['python'])
     np.random.set_state(state['numpy'])
     torch.set_rng_state(state['torch'])
@@ -143,8 +196,11 @@ def set_rng_state(state):
         torch.cuda.set_rng_state_all(state['cuda'])
 
 
-def collect_rng_states(ddp):
-    """Estados aleatórios de todos os ranks (relevantes se dropout > 0)."""
+def collect_rng_states(ddp: bool) -> list[dict[str, Any]]:
+    """Estados aleatórios de todos os ranks (relevantes se dropout > 0).
+
+    Em DDP é uma op coletiva: todos os ranks precisam chamá-la.
+    """
     local = get_rng_state()
     if ddp:
         states = [None] * dist.get_world_size()
@@ -153,16 +209,16 @@ def collect_rng_states(ddp):
     return [local]
 
 
-def save_checkpoint(path, checkpoint):
+def save_checkpoint(path: str, checkpoint: dict[str, Any]) -> None:
     tmp = path + '.tmp'
     torch.save(checkpoint, tmp)
     os.replace(tmp, path)
 
 
-def new_timing():
+def new_timing() -> dict[str, float]:
     return {
-        'train_time_s': 0.0, # todos os passos (inclui compilação), sem avaliação
-        'warmup_time_s': 0.0, # passos excluídos da média estável
+        'train_time_s': 0.0,    # todos os passos (inclui compilação), sem avaliação
+        'warmup_time_s': 0.0,   # passos excluídos da média estável
         'steady_time_s': 0.0,
         'steady_sq_s': 0.0,
         'steady_iters': 0,
@@ -170,9 +226,12 @@ def new_timing():
     }
 
 
-def prepare_metrics_file(metrics_file, init_from, resume_iter, reevaluates_resume_iter):
-    """Na retomada, mantém as linhas anteriores. A linha da própria iteração de
-    retomada só é descartada se ela for avaliada de novo."""
+def prepare_metrics_file(metrics_file: str, init_from: str, resume_iter: int, reevaluates_resume_iter: bool) -> None:
+    """Cria o CSV de métricas (do zero) ou o prepara para a retomada.
+
+    Na retomada mantém as linhas anteriores; a linha da própria iteração de
+    retomada só é descartada se ela for avaliada de novo.
+    """
     previous_rows = []
     limit = resume_iter if reevaluates_resume_iter else resume_iter + 1
     if init_from == 'resume' and os.path.exists(metrics_file):
@@ -188,27 +247,36 @@ def prepare_metrics_file(metrics_file, init_from, resume_iter, reevaluates_resum
         writer.writeheader()
         writer.writerows(previous_rows)
 
-def train_loop(model, raw_model, optimizer, scaler, ctx, cfg, rt, timing):
+
+
+def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtime,
+               timing: dict[str, float]) -> tuple[int, dict[str, float] | None]:
+    """Executa o treino de cfg.start_iter até max_iters (ou stop_iter).
+
+    atualiza o modelo e o otimizador, grava o CSV de métricas e o checkpoint (no processo mestre) 
+    e acumula os tempos em `timing`. Retorna a última iteração alcançada e as últimas perdas de
+    monitoramento.
+    """
     micro_per_rank = cfg.grad_accum_per_rank
-    micro_total = micro_per_rank * rt.world_size
-    tokens_per_iter = micro_total * cfg.batch_size * cfg.block_size
+    tokens_per_iter = micro_per_rank * rt.world_size * cfg.batch_size * cfg.block_size
     iter_num = cfg.start_iter
     local_iter = 0
     running_mfu = -1.0
     last_losses = None
     interval_time, interval_iters = 0.0, 0
 
-    def train_batch(it, micro):
-        g = it * micro_total + micro * rt.world_size + rt.rank
+    def train_batch(it: int, micro: int):
+        g = global_micro_batch(it, micro, rt.rank, micro_per_rank, rt.world_size)
         ids = rt.sampler.ids(g * cfg.batch_size, cfg.batch_size)
         return load_windows(rt.train_path, ids, cfg.block_size, rt.device, rt.device_type)
 
-    if rt.master:
+    if rt.master and not cfg.eval_only:
         prepare_metrics_file(
             rt.metrics_file, cfg.init_from, iter_num,
             iter_num % cfg.eval_interval == 0 or iter_num == cfg.max_iters)
 
-    X, Y = train_batch(iter_num, 0) if iter_num < cfg.max_iters else (None, None)
+    X, Y = (train_batch(iter_num, 0)
+            if iter_num < cfg.max_iters and not cfg.eval_only else (None, None))
 
     while True:
         lr = (get_lr(iter_num, cfg.warmup_iters, cfg.lr_decay_iters,
@@ -218,7 +286,8 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg, rt, timing):
             group['lr'] = lr
 
         stop_here = cfg.stop_iter is not None and iter_num >= cfg.stop_iter
-        if iter_num % cfg.eval_interval == 0 or iter_num == cfg.max_iters or stop_here:
+        if (iter_num % cfg.eval_interval == 0 or iter_num == cfg.max_iters
+                or stop_here or cfg.eval_only):
             if rt.ddp:
                 dist.barrier()
             rng_states = collect_rng_states(rt.ddp)
@@ -242,22 +311,25 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg, rt, timing):
                       f"val loss {losses['val']:.4f} | val ppl {math.exp(losses['val']):.2f} | "
                       f"passo {step_ms:.1f} ms | {tok_s:,.0f} tok/s")
 
-                with open(rt.metrics_file, 'a', newline='') as f:
-                    csv.writer(f).writerow([
-                        iter_num,
-                        f"{losses['train']:.4f}",
-                        f"{losses['val']:.4f}",
-                        f"{math.exp(losses['train']):.2f}",
-                        f"{math.exp(losses['val']):.2f}",
-                        f"{lr:.6e}",
-                        f"{step_ms:.2f}",
-                        f"{tok_s:.0f}",
-                        f"{timing['train_time_s']:.2f}",
-                        f"{timing['eval_time_s']:.2f}",
-                    ])
+                # eval_only só mede: não altera o CSV nem o checkpoint.
+                if not cfg.eval_only:
+                    with open(rt.metrics_file, 'a', newline='') as f:
+                        csv.writer(f).writerow([
+                            iter_num,
+                            f"{losses['train']:.4f}",
+                            f"{losses['val']:.4f}",
+                            f"{math.exp(losses['train']):.2f}",
+                            f"{math.exp(losses['val']):.2f}",
+                            f"{lr:.6e}",
+                            f"{step_ms:.2f}",
+                            f"{tok_s:.0f}",
+                            f"{timing['train_time_s']:.2f}",
+                            f"{timing['eval_time_s']:.2f}",
+                        ])
 
-                # não há seleção de modelo; o modelo avaliado é o final (iteração max_iters).
-                if iter_num > 0:
+                # Sempre o checkpoint mais recente: não há seleção de modelo;
+                # o modelo avaliado é o final (iteração max_iters).
+                if iter_num > 0 and not cfg.eval_only:
                     save_checkpoint(rt.checkpoint_path, {
                         'model': raw_model.state_dict(),
                         'optimizer': optimizer.state_dict(),
@@ -276,11 +348,10 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg, rt, timing):
             if rt.ddp:
                 dist.barrier()
 
-        if iter_num == 0 and cfg.eval_only:
-            break
-        if iter_num >= cfg.max_iters or stop_here:
+        if cfg.eval_only or iter_num >= cfg.max_iters or stop_here:
             break
 
+        # (cronometrado sem a avaliação) 
         sync(rt.device_type)
         t_start = time.perf_counter()
 
@@ -292,6 +363,7 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg, rt, timing):
                 _, loss = model(X, Y)
                 loss = loss / micro_per_rank
             loss_accum += loss.detach().float()
+            
             if micro + 1 < micro_per_rank:
                 X, Y = train_batch(iter_num, micro + 1)
             elif iter_num + 1 < cfg.max_iters:
@@ -322,6 +394,8 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg, rt, timing):
         if iter_num % cfg.log_interval == 0 and rt.master:
             lossf = loss_accum.item()
             if steady:
+                # estimate_mfu do nanoGPT assume pico de 312 TFLOPS (A100 bf16);
+                # reescala para o pico da GPU informada.
                 mfu = raw_model.estimate_mfu(cfg.batch_size * micro_per_rank, dt)
                 mfu *= 312.0 / cfg.peak_tflops
                 running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
@@ -332,8 +406,9 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg, rt, timing):
         local_iter += 1
 
     return iter_num, last_losses
-  
-def parse_args():
+
+
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Treinamento das variantes de bloco do GPT no C4")
     BOOL = argparse.BooleanOptionalAction
 
@@ -346,7 +421,8 @@ def parse_args():
     p.add_argument('--eval_interval', type=int, default=250)
     p.add_argument('--log_interval', type=int, default=1)
     p.add_argument('--eval_iters', type=int, default=200)
-    p.add_argument('--eval_only', action='store_true')
+    p.add_argument('--eval_only', action='store_true',
+                   help='só avalia o estado atual (do zero ou do checkpoint) e encerra, sem gravar nada')
     p.add_argument('--stop_iter', type=int, default=None,
                    help='interrompe (com checkpoint) nesta iteração sem alterar o cronograma; '
                         'útil em clusters com limite de tempo')
@@ -382,23 +458,57 @@ def parse_args():
                    help='iterações iniciais de cada processo excluídas da média de tempo')
     p.add_argument('--peak_tflops', type=float, default=65.0,
                help='pico teórico da NVIDIA T4 em FP16')
-    return p.parse_args()
+    return p
+
+
+def validate_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Valida a entrada do usuário. Usa parser.error (mensagem e código de
+    saída 2), e não assert, que é removido quando o Python roda com -O."""
+    positive = ['eval_interval', 'log_interval', 'eval_iters', 'grad_accum', 'batch_size',
+                'block_size', 'n_layer', 'n_head', 'n_embd', 'max_iters', 'lr_decay_iters',
+                'learning_rate', 'peak_tflops']
+    for name in positive:
+        if getattr(args, name) <= 0:
+            p.error(f"--{name} deve ser positivo")
+    if args.timing_warmup_iters < 0:
+        p.error("--timing_warmup_iters não pode ser negativo")
+    if args.warmup_iters < 0:
+        p.error("--warmup_iters não pode ser negativo")
+    if args.decay_lr and not args.warmup_iters < args.lr_decay_iters:
+        p.error("--warmup_iters deve ser menor que --lr_decay_iters")
+    if not 0 <= args.min_lr <= args.learning_rate:
+        p.error("exige 0 <= --min_lr <= --learning_rate")
+    if not 0 <= args.dropout < 1:
+        p.error("--dropout deve estar em [0, 1)")
+    if not (0 <= args.beta1 < 1 and 0 <= args.beta2 < 1):
+        p.error("--beta1 e --beta2 devem estar em [0, 1)")
+    if args.weight_decay < 0 or args.grad_clip < 0:
+        p.error("--weight_decay e --grad_clip não podem ser negativos")
+    if args.n_embd % args.n_head != 0:
+        p.error("--n_embd deve ser múltiplo de --n_head")
+    if args.stop_iter is not None and not 0 < args.stop_iter <= args.max_iters:
+        p.error("--stop_iter deve estar em (0, max_iters]")
 
 
 class Config:
-    def __init__(self, args):
+    """Configuração da execução: argumentos da linha de comando mais campos derivados."""
+
+    def __init__(self, args: argparse.Namespace) -> None:
         self.__dict__.update(vars(args))
 
-    def as_dict(self):
+    def as_dict(self) -> dict[str, Any]:
         return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
 
 
 class Runtime:
-    pass
+    """Estado do processo (DDP, dispositivo, caminhos, amostrador); não é salvo."""
 
 
-def main():
-    cfg = Config(parse_args())
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    validate_args(parser, args)
+    cfg = Config(args)
     if cfg.out_dir is None:
         cfg.out_dir = os.path.join(BASE_DIR, 'out', f'{cfg.block_type}_s{cfg.seed}')
 
@@ -407,6 +517,16 @@ def main():
     if rt.ddp:
         # Timeout maior: só o rank 0 avalia enquanto os demais aguardam na barreira.
         init_process_group(backend=cfg.backend, timeout=timedelta(minutes=60))
+    try:
+        run(cfg, rt)
+    finally:
+        
+        if rt.ddp and dist.is_initialized():
+            destroy_process_group()
+
+
+def run(cfg: Config, rt: Runtime) -> None:
+    if rt.ddp:
         rt.rank = int(os.environ['RANK'])
         local_rank = int(os.environ['LOCAL_RANK'])
         rt.world_size = int(os.environ['WORLD_SIZE'])
@@ -420,7 +540,9 @@ def main():
     if cfg.dtype is None:
         cfg.dtype = default_dtype(rt.device_type)
 
-    assert cfg.grad_accum % rt.world_size == 0, "grad_accum deve ser múltiplo de world_size"
+    if cfg.grad_accum % rt.world_size != 0:
+        raise ValueError(f"grad_accum ({cfg.grad_accum}) deve ser múltiplo do "
+                         f"número de processos ({rt.world_size})")
     cfg.grad_accum_per_rank = cfg.grad_accum // rt.world_size
     tokens_per_iter = cfg.grad_accum * cfg.batch_size * cfg.block_size
 
@@ -444,16 +566,22 @@ def main():
     torch.backends.cudnn.allow_tf32 = True
     ctx = autocast_ctx(rt.device_type, cfg.dtype)
 
+    cfg.data_fingerprint = data_fingerprint([rt.train_path, val_path])
     n_train = count_windows(rt.train_path, cfg.block_size)
     n_val = count_windows(val_path, cfg.block_size)
     n_monitor = cfg.eval_iters * cfg.batch_size
+    if n_monitor > n_train:
+        raise ValueError(f"Monitoramento ({n_monitor:,} janelas) maior que o treino "
+                         f"({n_train:,} janelas). Reduza --eval_iters ou --batch_size.")
     if n_monitor >= n_val:
-        raise ValueError("Validação pequena demais para o monitoramento e a avaliação final.")
+        raise ValueError(f"Monitoramento ({n_monitor:,} janelas) não deixa janelas de "
+                         f"validação ({n_val:,}) para a avaliação final.")
     cfg.val_monitor_windows = n_monitor
     rt.sampler = TrainSampler(n_train, cfg.seed)
     rt.monitor = {
         'train': (rt.train_path,
                   np.random.default_rng(MONITOR_SEED).choice(n_train, n_monitor, replace=False)),
+        # Primeiras janelas da validação; as demais ficam para a avaliação final.
         'val': (val_path, np.arange(n_monitor)),
     }
 
@@ -470,13 +598,14 @@ def main():
         if not os.path.exists(rt.checkpoint_path):
             raise FileNotFoundError(f"Checkpoint não encontrado: {rt.checkpoint_path}")
         checkpoint = torch.load(rt.checkpoint_path, map_location=rt.device, weights_only=False)
-        if checkpoint['model_args'].get('block_type') != cfg.block_type:
-            raise ValueError("O block_type do checkpoint não corresponde à variante solicitada.")
         saved = checkpoint.get('config', {})
         diffs = [k for k in RESUME_LOCKED_KEYS
-                 if k in saved and saved[k] != getattr(cfg, k)]
+                 if saved.get(k, '<ausente>') != getattr(cfg, k)]
         if diffs:
-            raise ValueError(f"Hiperparâmetros diferentes do checkpoint: {diffs}")
+            raise ValueError(
+                "Configuração diferente da do checkpoint em: "
+                + ", ".join(f"{k} ({saved.get(k, '<ausente>')!r} -> {getattr(cfg, k)!r})"
+                            for k in diffs))
         model_args = checkpoint['model_args']
         cfg.start_iter = checkpoint['iter_num']
         timing.update(checkpoint.get('timing', {}))
@@ -507,21 +636,23 @@ def main():
               f"tokens/parâmetro: {planned_tokens / total_params:.2f}")
         print(f"Janelas de treino: {n_train:,} | épocas planejadas: {planned_epochs:.4f}")
 
-        run_info = {
-            'config': cfg.as_dict(),
-            'tokens_per_iter': tokens_per_iter,
-            'planned_tokens': planned_tokens,
-            'planned_epochs': planned_epochs,
-            'params_total': total_params,
-            'params_non_embedding': non_emb_params,
-            'tokens_per_param': planned_tokens / total_params,
-            'train_windows': n_train,
-            'val_windows': n_val,
-            'world_size': rt.world_size,
-            'environment': environment_info(),
-        }
-        name = 'config.json' if cfg.init_from == 'scratch' else f'config_resume_{cfg.start_iter}.json'
-        write_json(os.path.join(cfg.out_dir, name), run_info)
+        if not cfg.eval_only:
+            run_info = {
+                'config': cfg.as_dict(),
+                'tokens_per_iter': tokens_per_iter,
+                'planned_tokens': planned_tokens,
+                'planned_epochs': planned_epochs,
+                'params_total': total_params,
+                'params_non_embedding': non_emb_params,
+                'tokens_per_param': planned_tokens / total_params,
+                'train_windows': n_train,
+                'val_windows': n_val,
+                'world_size': rt.world_size,
+                'environment': environment_info(),
+            }
+            name = ('config.json' if cfg.init_from == 'scratch'
+                    else f'config_resume_{cfg.start_iter}.json')
+            write_json(os.path.join(cfg.out_dir, name), run_info)
 
     scaler = torch.amp.GradScaler('cuda', enabled=(cfg.dtype == 'float16' and rt.device_type == 'cuda'))
     optimizer = model.configure_optimizers(
@@ -554,7 +685,7 @@ def main():
     final_iter, last_losses = train_loop(
         model, raw_model, optimizer, scaler, ctx, cfg, rt, timing)
 
-    if rt.master and final_iter >= cfg.max_iters:
+    if rt.master and not cfg.eval_only and final_iter >= cfg.max_iters:
         n = timing['steady_iters']
         mean_s = timing['steady_time_s'] / n if n else float('nan')
         var = timing['steady_sq_s'] / n - mean_s ** 2 if n else float('nan')
@@ -584,9 +715,6 @@ def main():
         }
         write_json(os.path.join(cfg.out_dir, 'summary.json'), summary)
         print(f"Resumo salvo em {os.path.join(cfg.out_dir, 'summary.json')}")
-
-    if rt.ddp:
-        destroy_process_group()
 
 
 if __name__ == "__main__":
