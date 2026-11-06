@@ -380,8 +380,8 @@ def parse_args():
                    help='permite que o orçamento ultrapasse uma época do train.bin')
     p.add_argument('--timing_warmup_iters', type=int, default=10,
                    help='iterações iniciais de cada processo excluídas da média de tempo')
-    p.add_argument('--peak_tflops', type=float, default=312.0,
-                   help='pico teórico da GPU no dtype usado (T4 bf16 = 65)')
+    p.add_argument('--peak_tflops', type=float, default=65.0,
+               help='pico teórico da NVIDIA T4 em FP16')
     return p.parse_args()
 
 
