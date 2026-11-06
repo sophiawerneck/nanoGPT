@@ -381,7 +381,7 @@ def parse_args():
     p.add_argument('--timing_warmup_iters', type=int, default=10,
                    help='iterações iniciais de cada processo excluídas da média de tempo')
     p.add_argument('--peak_tflops', type=float, default=312.0,
-                   help='pico teórico da GPU no dtype usado (A100 bf16 = 312)')
+                   help='pico teórico da GPU no dtype usado (T4 bf16 = 65)')
     return p.parse_args()
 
 
