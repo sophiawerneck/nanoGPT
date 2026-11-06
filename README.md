@@ -46,16 +46,42 @@ bash run_all.sh
 ```
 Por padrão, ele treina as 3 variantes (seq, inv, par) com 3 sementes cada (1337, 1338, 1339), o que leva cerca de 8 h por execução numa A100 (~72 GPU-horas no total). O script pode ser executado de novo após uma interrupção: ele pula as etapas concluídas e retoma as interrompidas. Variações:
 
+### Preparação dos dados
+```bash
+python data/c4/prepare.py
+```
+Gera data/c4/train.bin e data/c4/validation.bin a partir do C4 en, com o tokenizador BPE do GPT-2. A versão do dataset, as contagens e o SHA-256 de cada arquivo ficam em data/c4/*_meta.json.
+
 ### Treinamento
 
 ```bash
-<comando_exato_de_treinamento>
+python train.py --block_type seq --seed 1337
+python train.py --block_type inv --seed 1337
+python train.py --block_type par --seed 1337
 ```
+Repita os três comandos com --seed 1338 e --seed 1339. Para treinar em várias GPUs:
+```bash
+torchrun --standalone --nproc_per_node=4 train.py --block_type seq --seed 1337
+```
+Para retomar um treino interrompido do último checkpoint, adicione --init_from resume. Os hiperparâmetros padrão do train.py são os usados no relatório. Cada execução grava seus artefatos em out/<variante>_s<semente>/.
+
 
 ### Avaliação
-
+Perplexidade final, calculada na porção da validação não usada durante o treino:
 ```bash
-<comando_exato_de_avaliacao>
+python evaluate.py --out_dir out/seq_s1337
+python evaluate.py --out_dir out/inv_s1337
+python evaluate.py --out_dir out/par_s1337
 ```
 
-<!-- Informar como acessar os resultados gerados, caso necessário. -->
+Latência de inferência (prefill e geração):
+```bash
+python benchmark.py --out_dir out/seq_s1337
+python benchmark.py --out_dir out/inv_s1337
+python benchmark.py --out_dir out/par_s1337
+```
+Repita para as demais sementes. Em seguida, agregue os resultados:
+```bash
+python summarize.py
+```
+## Resultados gerados
