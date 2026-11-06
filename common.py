@@ -1,5 +1,5 @@
 """Funções compartilhadas entre preparação, treino, avaliação e benchmark."""
-
+import hashlib
 import os
 import json
 import platform
@@ -12,6 +12,16 @@ import torch
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_DTYPE = np.uint16  
 
+
+def file_sha256(path, chunk_bytes=64 * 1024 * 1024):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(chunk_bytes)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
 
 def count_tokens(path):
     return os.path.getsize(path) // np.dtype(TOKEN_DTYPE).itemsize
