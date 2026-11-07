@@ -59,11 +59,15 @@ PyTorch).
 from __future__ import annotations
 
 import os
+import sys
 import time
 import math
 import random
 import csv
 import argparse
+import logging
+from functools import partial
+from dataclasses import dataclass, field, asdict
 from datetime import timedelta
 from typing import Any, Callable
 import pickle
@@ -73,12 +77,15 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
+from simple_parsing import ArgumentParser
 from model import GPTConfig, GPT
 from common import (
     BASE_DIR, count_windows, load_windows, default_dtype, autocast_ctx, sync,
     strip_compile_prefix, count_params, environment_info, write_json, read_json,
     file_sha256,
 )
+
+logger = logging.getLogger(__name__)
 
 DATASET_PRESETS: dict[str, dict[str, Any]] = {
     'c4': {},
@@ -124,15 +131,116 @@ METRIC_COLUMNS = [
     'val_holdout_ppl',
 ]
 
+@dataclass
+class Config:
+    """Configuração da execução: Única Fonte de Verdade para argumentos e validação."""
+    block_type: str = "seq"  # opções: 'seq', 'inv', 'par'
+    init_from: str = "scratch"  # opções: 'scratch', 'resume'
+    seed: int = 1337
+    out_dir: str | None = None
+    dataset: str = "c4"
+    data_dir: str | None = None
+
+    eval_interval: int = 250
+    log_interval: int = 1
+    eval_iters: int = 200
+    eval_only: bool = False
+    stop_iter: int | None = None
+
+    grad_accum: int = 40  # 5 * 8
+    batch_size: int = 12
+    block_size: int = 1024
+
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = False
+
+    learning_rate: float = 6e-4
+    min_lr: float = 6e-5
+    max_iters: int = 6100
+    lr_decay_iters: int = 6100
+    warmup_iters: int = 200
+    weight_decay: float = 1e-1
+    beta1: float = 0.9
+    beta2: float = 0.95
+    grad_clip: float = 1.0
+    decay_lr: bool = True
+
+    backend: str = "nccl"
+    device: str = "cuda"
+    dtype: str | None = None
+    compile: bool = True
+    allow_multi_epoch: bool = False
+    timing_warmup_iters: int = 10
+    peak_tflops: float = 65.0
+
+    # ignorados pelo CLI devido ao init=False
+    grad_accum_per_rank: int = field(default=0, init=False)
+    data_fingerprint: dict[str, Any] = field(default_factory=dict, init=False)
+    val_monitor_windows: int = field(default=0, init=False)
+    val_holdout_windows: int = field(default=0, init=False)
+    start_iter: int = field(default=0, init=False)
+    model_args: dict[str, Any] = field(default_factory=dict, init=False)
+    _resume_final_losses: dict[str, float] | None = field(default=None, init=False)
+
+    def __post_init__(self):
+        if self.block_type not in ["seq", "inv", "par"]:
+            raise ValueError(f"--block_type deve ser 'seq', 'inv' ou 'par'. Recebido: {self.block_type}")
+        if self.init_from not in ["scratch", "resume"]:
+            raise ValueError(f"--init_from deve ser 'scratch' ou 'resume'. Recebido: {self.init_from}")
+        if self.dtype is not None and self.dtype not in ["float32", "bfloat16", "float16"]:
+            raise ValueError("--dtype deve ser float32, bfloat16 ou float16")
+
+        positive = ['eval_interval', 'log_interval', 'eval_iters', 'grad_accum', 'batch_size',
+                    'block_size', 'n_layer', 'n_head', 'n_embd', 'max_iters', 'lr_decay_iters',
+                    'learning_rate', 'peak_tflops']
+        for name in positive:
+            if getattr(self, name) <= 0:
+                raise ValueError(f"--{name} deve ser positivo")
+
+        if self.timing_warmup_iters < 0:
+            raise ValueError("--timing_warmup_iters não pode ser negativo")
+        if self.warmup_iters < 0:
+            raise ValueError("--warmup_iters não pode ser negativo")
+        if self.decay_lr and not (self.warmup_iters < self.lr_decay_iters):
+            raise ValueError("--warmup_iters deve ser menor que --lr_decay_iters")
+        if not (0 <= self.min_lr <= self.learning_rate):
+            raise ValueError("exige 0 <= --min_lr <= --learning_rate")
+        if not (0 <= self.dropout < 1):
+            raise ValueError("--dropout deve estar em [0, 1)")
+        if not (0 <= self.beta1 < 1 and 0 <= self.beta2 < 1):
+            raise ValueError("--beta1 e --beta2 devem estar em [0, 1)")
+        if self.weight_decay < 0 or self.grad_clip < 0:
+            raise ValueError("--weight_decay e --grad_clip não podem ser negativos")
+        if self.n_embd % self.n_head != 0:
+            raise ValueError("--n_embd deve ser múltiplo de --n_head")
+        if self.stop_iter is not None and not (0 < self.stop_iter <= self.max_iters):
+            raise ValueError("--stop_iter deve estar em (0, max_iters]")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {k: v for k, v in asdict(self).items() if not k.startswith('_')}
+
+@dataclass
+class Runtime:
+    """Estado do processo (DDP, dispositivo, caminhos, amostrador); não é salvo."""
+    ddp: bool = False
+    rank: int = 0
+    world_size: int = 1
+    device: str = "cpu"
+    master: bool = True
+    device_type: str = "cpu"
+    checkpoint_path: str = ""
+    metrics_file: str = ""
+    train_path: str = ""
+    sampler: TrainSampler | None = None
+    monitor: dict[str, tuple[str, np.ndarray]] = field(default_factory=dict)
+    val_holdout: tuple[str, np.ndarray] | None = None
+
+
 class TrainSampler:
-    """Ordem sem reposição sobre as janelas de treino.
-
-    A amostra global de índice s pertence à época s // n e ocupa a posição
-    s % n de uma permutação gerada com (seed, época). O lote de qualquer
-    iteração pode ser recalculado a partir de iter_num, o que torna a
-    retomada exata sem guardar o estado do carregador.
-    """
-
+    """Ordem sem reposição sobre as janelas de treino."""
     def __init__(self, num_windows: int, seed: int) -> None:
         if num_windows <= 0:
             raise ValueError("num_windows deve ser positivo")
@@ -158,20 +266,10 @@ class TrainSampler:
 
 
 def global_micro_batch(it: int, micro: int, rank: int, micro_per_rank: int, world_size: int) -> int:
-    """Índice global do micro-lote (iteração, micro-passo, rank).
-
-    Cada iteração consome micro_per_rank * world_size micro-lotes consecutivos,
-    então o conjunto de dados de uma iteração não depende do número de GPUs.
-    """
+    """Índice global do micro-lote (iteração, micro-passo, rank)."""
     return it * micro_per_rank * world_size + micro * world_size + rank
 
 def data_fingerprint(paths: list[str]) -> dict[str, dict[str, Any]]:
-    """Identidade dos arquivos de dados: tamanho em bytes e SHA-256.
-
-    Para o C4, o SHA-256 vem dos metadados de prepare_c4.py (calcular o hash
-    de 6 GB a cada execução seria lento). Para datasets sem esses metadados,
-    como o Tiny Shakespeare, o hash é calculado na hora.
-    """
     fp = {}
     for path in paths:
         name = os.path.basename(path)
@@ -201,11 +299,7 @@ def dataset_vocab_size(data_dir: str) -> int:
 def estimate_loss(model: torch.nn.Module, ctx, monitor: dict[str, tuple[str, np.ndarray]],
                   batch_size: int, block_size: int, device: str,
                   device_type: str) -> dict[str, float]:
-    """Calcula a loss média ponderada em subconjuntos fixos de janelas.
-
-    A ponderação pelo tamanho do lote evita dar o mesmo peso ao último lote,
-    caso ele seja menor que os demais. O modo anterior do modelo é restaurado.
-    """
+    """Calcula a loss média ponderada em subconjuntos fixos de janelas."""
     out = {}
     was_training = model.training
     model.eval()
@@ -230,7 +324,6 @@ def estimate_loss(model: torch.nn.Module, ctx, monitor: dict[str, tuple[str, np.
   
 def get_lr(it: int, warmup_iters: int, lr_decay_iters: int, learning_rate: float,
            min_lr: float) -> float:
-    """Aquecimento linear seguido de decaimento cosseno até min_lr."""
     if it < warmup_iters:
         return learning_rate * (it + 1) / (warmup_iters + 1)
     if it > lr_decay_iters:
@@ -260,10 +353,6 @@ def set_rng_state(state: dict[str, Any]) -> None:
 
 
 def collect_rng_states(ddp: bool) -> list[dict[str, Any]]:
-    """Estados aleatórios de todos os ranks (relevantes se dropout > 0).
-
-    Em DDP é uma op coletiva: todos os ranks precisam chamá-la.
-    """
     local = get_rng_state()
     if ddp:
         states = [None] * dist.get_world_size()
@@ -274,7 +363,6 @@ def collect_rng_states(ddp: bool) -> list[dict[str, Any]]:
 
 def save_checkpoint(path: str, checkpoint: dict[str, Any]) -> None:
     tmp = path + '.tmp'
-
     try:
         torch.save(checkpoint, tmp)
         os.replace(tmp, path)
@@ -297,11 +385,6 @@ def new_timing() -> dict[str, float]:
 
 
 def prepare_metrics_file(metrics_file: str, init_from: str, resume_iter: int, reevaluates_resume_iter: bool) -> None:
-    """Cria o CSV de métricas (do zero) ou o prepara para a retomada.
-
-    Na retomada mantém as linhas anteriores; a linha da própria iteração de
-    retomada só é descartada se ela for avaliada de novo.
-    """
     previous_rows = []
     limit = resume_iter if reevaluates_resume_iter else resume_iter + 1
     if init_from == 'resume' and os.path.exists(metrics_file):
@@ -334,8 +417,6 @@ def evaluate_and_save_checkpoint(
         losses = estimate_loss(raw_model, ctx, rt.monitor, cfg.batch_size,
                                cfg.block_size, rt.device, rt.device_type)
 
-        # A avaliação independente é executada apenas ao finalizar o orçamento
-        # ou em eval_only; ela não participa do monitoramento periódico.
         final_evaluation = iter_num >= cfg.max_iters or cfg.eval_only
         if final_evaluation:
             holdout_losses = estimate_loss(
@@ -354,15 +435,15 @@ def evaluate_and_save_checkpoint(
             step_ms, tok_s = float('nan'), float('nan')
 
         if 'val_holdout' in losses:
-            print(f"step {iter_num}: train loss {losses['train']:.4f} | "
-                  f"val monitor loss {losses['val']:.4f} | "
-                  f"val holdout loss {losses['val_holdout']:.4f} | "
-                  f"val holdout ppl {math.exp(losses['val_holdout']):.2f} | "
-                  f"passo {step_ms:.1f} ms | {tok_s:,.0f} tok/s")
+            logger.info(f"step {iter_num}: train loss {losses['train']:.4f} | "
+                        f"val monitor loss {losses['val']:.4f} | "
+                        f"val holdout loss {losses['val_holdout']:.4f} | "
+                        f"val holdout ppl {math.exp(losses['val_holdout']):.2f} | "
+                        f"passo {step_ms:.1f} ms | {tok_s:,.0f} tok/s")
         else:
-            print(f"step {iter_num}: train loss {losses['train']:.4f} | "
-                  f"val loss {losses['val']:.4f} | val ppl {math.exp(losses['val']):.2f} | "
-                  f"passo {step_ms:.1f} ms | {tok_s:,.0f} tok/s")
+            logger.info(f"step {iter_num}: train loss {losses['train']:.4f} | "
+                        f"val loss {losses['val']:.4f} | val ppl {math.exp(losses['val']):.2f} | "
+                        f"passo {step_ms:.1f} ms | {tok_s:,.0f} tok/s")
 
         mfu_count = int(timing.get('mfu_count', 0))
         mfu_mean_percent = (
@@ -388,20 +469,20 @@ def evaluate_and_save_checkpoint(
 
         if iter_num > 0 and not cfg.eval_only:
             save_checkpoint(rt.checkpoint_path, {
-                'model': raw_model.state_dict(), # pesos do modelo
-                'optimizer': optimizer.state_dict(), # estado do adamw 
-                'scaler': scaler.state_dict(), # estado do grandscalar (só é ativado quando fp16; ele multiplica a loss por um fator de escala dinamico antes do backpropagation -> evitar underflow num)
+                'model': raw_model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scaler': scaler.state_dict(),
                 'model_args': cfg.model_args,
                 'config': cfg.as_dict(),
-                'iter_num': iter_num, # em qual iteração o checkpoint foi salvo
+                'iter_num': iter_num,
                 'train_loss': losses['train'],
                 'val_loss': losses['val'],
                 'val_holdout_loss': losses.get('val_holdout'),
-                'timing': dict(timing), # informações de desempenho
-                'rng_states': rng_states, # estados dos geradores aleatórios
+                'timing': dict(timing),
+                'rng_states': rng_states,
                 'world_size': rt.world_size,
             })
-            print(f"Checkpoint salvo em {rt.checkpoint_path}")
+            logger.info(f"Checkpoint salvo em {rt.checkpoint_path}")
 
     if rt.ddp:
         dist.barrier()
@@ -440,14 +521,15 @@ def perform_training_step(
     return loss_accum.item(), X, Y
 
 
+def train_batch(it: int, micro: int, cfg: Config, rt: Runtime) -> tuple[torch.Tensor, torch.Tensor]:
+    """Retorna um lote de treinamento baseado na iteração e micro-passo globais."""
+    g = global_micro_batch(it, micro, rt.rank, cfg.grad_accum_per_rank, rt.world_size)
+    ids = rt.sampler.ids(g * cfg.batch_size, cfg.batch_size)
+    return load_windows(rt.train_path, ids, cfg.block_size, rt.device, rt.device_type)
+
+
 def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtime,
                timing: dict[str, float]) -> tuple[int, dict[str, float] | None]:
-    """Executa o treino de cfg.start_iter até max_iters (ou stop_iter).
-
-    atualiza o modelo e o otimizador, grava o CSV de métricas e o checkpoint (no processo mestre) 
-    e acumula os tempos em `timing`. Retorna a última iteração alcançada e as últimas perdas de
-    monitoramento.
-    """
     micro_per_rank = cfg.grad_accum_per_rank
     tokens_per_iter = micro_per_rank * rt.world_size * cfg.batch_size * cfg.block_size
     iter_num = cfg.start_iter
@@ -456,14 +538,10 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtim
     last_losses = None
     interval_time, interval_iters = 0.0, 0
 
-    def train_batch(it: int, micro: int):
-        g = global_micro_batch(it, micro, rt.rank, micro_per_rank, rt.world_size)
-        ids = rt.sampler.ids(g * cfg.batch_size, cfg.batch_size)
-        return load_windows(rt.train_path, ids, cfg.block_size, rt.device, rt.device_type)
+    # Closure substituída pela injeção parcial (partial) da função externa pura
+    train_batch_fn = partial(train_batch, cfg=cfg, rt=rt)
 
     if rt.master and not cfg.eval_only:
-        # Se o checkpoint já contém todas as perdas da avaliação final, a
-        # retomada em max_iters pode reutilizá-las sem repetir a avaliação.
         resume_final_losses = getattr(cfg, '_resume_final_losses', None)
         reevaluates_resume_iter = (
             (iter_num % cfg.eval_interval == 0 or iter_num == cfg.max_iters)
@@ -472,7 +550,7 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtim
         prepare_metrics_file(
             rt.metrics_file, cfg.init_from, iter_num, reevaluates_resume_iter)
 
-    X, Y = (train_batch(iter_num, 0)
+    X, Y = (train_batch_fn(iter_num, 0)
             if iter_num < cfg.max_iters and not cfg.eval_only else (None, None))
 
     while True:
@@ -488,8 +566,8 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtim
                 and not cfg.eval_only):
             last_losses = dict(resume_final_losses)
             if rt.master:
-                print("Checkpoint já contém as métricas da avaliação final; "
-                      "reutilizando-as sem repetir a avaliação.")
+                logger.info("Checkpoint já contém as métricas da avaliação final; "
+                            "reutilizando-as sem repetir a avaliação.")
         elif (iter_num % cfg.eval_interval == 0 or iter_num == cfg.max_iters
               or stop_here or cfg.eval_only):
             new_losses = evaluate_and_save_checkpoint(
@@ -508,7 +586,7 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtim
         t_start = time.perf_counter()
 
         lossf, X, Y = perform_training_step(
-            iter_num, model, optimizer, scaler, ctx, cfg, rt, train_batch, X, Y
+            iter_num, model, optimizer, scaler, ctx, cfg, rt, train_batch_fn, X, Y
         )
 
         sync(rt.device_type)
@@ -525,8 +603,6 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtim
         else:
             timing['warmup_time_s'] += dt
 
-        # MFU por GPU, normalizado pelo pico teórico informado em --peak_tflops.
-        # A estimativa é acumulada somente nas iterações estáveis e no processo mestre.
         if steady and rt.master and rt.device_type == 'cuda':
             mfu = raw_model.estimate_mfu(cfg.batch_size * micro_per_rank, dt)
             mfu *= 312.0 / cfg.peak_tflops
@@ -538,8 +614,8 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtim
         if iter_num % cfg.log_interval == 0 and rt.master:
             mfu_text = f"{running_mfu * 100:.2f}%" if running_mfu >= 0.0 else "n/a"
             warmup_text = '' if steady else ' (aquecimento)'
-            print(f"iter {iter_num}: loss {lossf:.4f}, tempo {dt * 1000:.2f}ms, "
-                  f"mfu {mfu_text}{warmup_text}")
+            logger.info(f"iter {iter_num}: loss {lossf:.4f}, tempo {dt * 1000:.2f}ms, "
+                        f"mfu {mfu_text}{warmup_text}")
 
         iter_num += 1
         local_iter += 1
@@ -547,111 +623,21 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtim
     return iter_num, last_losses
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Treinamento das variantes de bloco do GPT no C4")
-    BOOL = argparse.BooleanOptionalAction
-
-    p.add_argument('--block_type', default='seq', choices=['seq', 'inv', 'par'])
-    p.add_argument('--init_from', default='scratch', choices=['scratch', 'resume'])
-    p.add_argument('--seed', type=int, default=1337)
-    p.add_argument('--out_dir', default=None, help='padrão: out/<block_type>_s<seed>')
-    p.add_argument('--dataset', default='c4', choices=list(DATASET_PRESETS),
-                   help='c4 (experimento) ou shakespeare_char (depuração); define os padrões')
-    p.add_argument('--data_dir', default=None)
-
-    p.add_argument('--eval_interval', type=int, default=250)
-    p.add_argument('--log_interval', type=int, default=1)
-    p.add_argument('--eval_iters', type=int, default=200)
-    p.add_argument('--eval_only', action='store_true',
-                   help='só avalia o estado atual (do zero ou do checkpoint) e encerra, sem gravar nada')
-    p.add_argument('--stop_iter', type=int, default=None,
-                   help='interrompe (com checkpoint) nesta iteração sem alterar o cronograma; '
-                        'útil em clusters com limite de tempo')
-
-    p.add_argument('--grad_accum', type=int, default=5 * 8)
-    p.add_argument('--batch_size', type=int, default=12)
-    p.add_argument('--block_size', type=int, default=1024)
-
-    p.add_argument('--n_layer', type=int, default=12)
-    p.add_argument('--n_head', type=int, default=12)
-    p.add_argument('--n_embd', type=int, default=768)
-    p.add_argument('--dropout', type=float, default=0.0)
-    p.add_argument('--bias', action=BOOL, default=False)
-
-    p.add_argument('--learning_rate', type=float, default=6e-4)
-    p.add_argument('--min_lr', type=float, default=6e-5)
-    p.add_argument('--max_iters', type=int, default=6100)
-    p.add_argument('--lr_decay_iters', type=int, default=6100)
-    p.add_argument('--warmup_iters', type=int, default=200)
-    p.add_argument('--weight_decay', type=float, default=1e-1)
-    p.add_argument('--beta1', type=float, default=0.9)
-    p.add_argument('--beta2', type=float, default=0.95)
-    p.add_argument('--grad_clip', type=float, default=1.0)
-    p.add_argument('--decay_lr', action=BOOL, default=True)
-
-    p.add_argument('--backend', default='nccl')
-    p.add_argument('--device', default='cuda')
-    p.add_argument('--dtype', default=None, choices=['float32', 'bfloat16', 'float16'])
-    p.add_argument('--compile', action=BOOL, default=True)
-    p.add_argument('--allow_multi_epoch', action='store_true',
-                   help='permite que o orçamento ultrapasse uma época do train.bin')
-    p.add_argument('--timing_warmup_iters', type=int, default=10,
-                   help='iterações iniciais de cada processo excluídas da média de tempo')
-    p.add_argument('--peak_tflops', type=float, default=65.0,
-               help='pico teórico da NVIDIA T4 em FP16')
-    return p
-
-
-def validate_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    """Valida a entrada do usuário. Usa parser.error (mensagem e código de
-    saída 2), e não assert, que é removido quando o Python roda com -O."""
-    positive = ['eval_interval', 'log_interval', 'eval_iters', 'grad_accum', 'batch_size',
-                'block_size', 'n_layer', 'n_head', 'n_embd', 'max_iters', 'lr_decay_iters',
-                'learning_rate', 'peak_tflops']
-    for name in positive:
-        if getattr(args, name) <= 0:
-            p.error(f"--{name} deve ser positivo")
-    if args.timing_warmup_iters < 0:
-        p.error("--timing_warmup_iters não pode ser negativo")
-    if args.warmup_iters < 0:
-        p.error("--warmup_iters não pode ser negativo")
-    if args.decay_lr and not args.warmup_iters < args.lr_decay_iters:
-        p.error("--warmup_iters deve ser menor que --lr_decay_iters")
-    if not 0 <= args.min_lr <= args.learning_rate:
-        p.error("exige 0 <= --min_lr <= --learning_rate")
-    if not 0 <= args.dropout < 1:
-        p.error("--dropout deve estar em [0, 1)")
-    if not (0 <= args.beta1 < 1 and 0 <= args.beta2 < 1):
-        p.error("--beta1 e --beta2 devem estar em [0, 1)")
-    if args.weight_decay < 0 or args.grad_clip < 0:
-        p.error("--weight_decay e --grad_clip não podem ser negativos")
-    if args.n_embd % args.n_head != 0:
-        p.error("--n_embd deve ser múltiplo de --n_head")
-    if args.stop_iter is not None and not 0 < args.stop_iter <= args.max_iters:
-        p.error("--stop_iter deve estar em (0, max_iters]")
-
-
-class Config:
-    """Configuração da execução: argumentos da linha de comando mais campos derivados."""
-
-    def __init__(self, args: argparse.Namespace) -> None:
-        self.__dict__.update(vars(args))
-
-    def as_dict(self) -> dict[str, Any]:
-        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
-
-
-class Runtime:
-    """Estado do processo (DDP, dispositivo, caminhos, amostrador); não é salvo."""
-
-
 def main() -> None:
-    parser = build_parser()
-    pre, _ = parser.parse_known_args()
-    parser.set_defaults(**DATASET_PRESETS[pre.dataset])
+    temp_parser = argparse.ArgumentParser(add_help=False)
+    temp_parser.add_argument('--dataset', default='c4')
+    pre, _ = temp_parser.parse_known_args()
+    
+    preset_kwargs = DATASET_PRESETS.get(pre.dataset, {})
+    preset_kwargs['dataset'] = pre.dataset
+    default_config = Config(**preset_kwargs)
+
+    parser = ArgumentParser(description="Treinamento das variantes de bloco do GPT no C4")
+    parser.add_arguments(Config, dest="cfg", default=default_config)
+    
     args = parser.parse_args()
-    validate_args(parser, args)
-    cfg = Config(args)
+    cfg: Config = args.cfg 
+
     if cfg.data_dir is None:
         cfg.data_dir = os.path.join(BASE_DIR, 'data', cfg.dataset)
     if cfg.out_dir is None:
@@ -674,15 +660,14 @@ def print_and_save_run_header(
     n_train: int, n_val: int
 ) -> None:
     if rt.master:
-        print("==== Iniciando treinamento ====")
-        print(f"Variante: {cfg.block_type.upper()} | semente: {cfg.seed} | world_size: {rt.world_size}")
-        print(f"Tokens por iteração: {tokens_per_iter:,}")
-        print(f"Parâmetros: {total_params:,} totais | {non_emb_params:,} sem embeddings")
-        print(f"Tokens planejados: {planned_tokens:,} | "
-              f"tokens/parâmetro: {planned_tokens / total_params:.2f}")
-        print(f"Janelas de treino: {n_train:,} | épocas planejadas: {planned_epochs:.4f}")
-        print(f"Validação: {cfg.val_monitor_windows:,} janelas de monitoramento | "
-              f"{cfg.val_holdout_windows:,} janelas reservadas para avaliação final")
+        logger.info("==== Iniciando treinamento ====")
+        logger.info(f"Variante: {cfg.block_type.upper()} | semente: {cfg.seed} | world_size: {rt.world_size}")
+        logger.info(f"Tokens por iteração: {tokens_per_iter:,}")
+        logger.info(f"Parâmetros: {total_params:,} totais | {non_emb_params:,} sem embeddings")
+        logger.info(f"Tokens planejados: {planned_tokens:,} | tokens/parâmetro: {planned_tokens / total_params:.2f}")
+        logger.info(f"Janelas de treino: {n_train:,} | épocas planejadas: {planned_epochs:.4f}")
+        logger.info(f"Validação: {cfg.val_monitor_windows:,} janelas de monitoramento | "
+                    f"{cfg.val_holdout_windows:,} janelas reservadas para avaliação final")
 
         if not cfg.eval_only:
             run_info = {
@@ -752,7 +737,7 @@ def save_final_summary(
             'gpu': environment_info().get('gpu_name'),
         }
         write_json(os.path.join(cfg.out_dir, 'summary.json'), summary)
-        print(f"Resumo salvo em {os.path.join(cfg.out_dir, 'summary.json')}")
+        logger.info(f"Resumo salvo em {os.path.join(cfg.out_dir, 'summary.json')}")
 
 
 def run(cfg: Config, rt: Runtime) -> None:
@@ -767,6 +752,14 @@ def run(cfg: Config, rt: Runtime) -> None:
         rt.device = cfg.device
     rt.master = rt.rank == 0
     rt.device_type = 'cuda' if 'cuda' in str(rt.device) else 'cpu'
+
+    # Logger config. e silenciado para processos paralelos que não sejam master
+    logging.basicConfig(
+        level=logging.INFO if rt.master else logging.WARNING,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S'
+    )
+
     if cfg.dtype is None:
         cfg.dtype = default_dtype(rt.device_type)
 
@@ -814,8 +807,6 @@ def run(cfg: Config, rt: Runtime) -> None:
                   np.random.default_rng(MONITOR_SEED).choice(n_train, n_monitor, replace=False)),
         'val': (val_path, np.arange(n_monitor)),
     }
-    # Todas as janelas restantes da validação ficam reservadas para a
-    # avaliação final e não são utilizadas no monitoramento periódico.
     rt.val_holdout = (val_path, np.arange(n_monitor, n_val))
 
     model_args = dict(
@@ -844,8 +835,6 @@ def run(cfg: Config, rt: Runtime) -> None:
         cfg.start_iter = checkpoint['iter_num']
         timing.update(checkpoint.get('timing', {}))
 
-        # Permite reconstruir summary.json sem repetir a avaliação final caso
-        # a execução tenha sido interrompida depois de salvar o checkpoint final.
         cfg._resume_final_losses = None
         if cfg.start_iter >= cfg.max_iters:
             saved_train_loss = checkpoint.get('train_loss')
@@ -860,7 +849,7 @@ def run(cfg: Config, rt: Runtime) -> None:
                 }
 
         if rt.master:
-            print(f"Retomando a partir da iteração {cfg.start_iter}.")
+            logger.info(f"Retomando a partir da iteração {cfg.start_iter}.")
     cfg.model_args = model_args
 
     model = GPT(GPTConfig(**model_args))
@@ -892,7 +881,7 @@ def run(cfg: Config, rt: Runtime) -> None:
 
     if cfg.compile:
         if rt.master:
-            print("Compilando o modelo...")
+            logger.info("Compilando o modelo...")
         model = torch.compile(model)
     if rt.ddp:
         model = DDP(model, device_ids=[local_rank])
@@ -905,12 +894,11 @@ def run(cfg: Config, rt: Runtime) -> None:
         if states is not None and len(states) == rt.world_size:
             set_rng_state(states[rt.rank])
         elif rt.master:
-            print("Aviso: estados aleatórios indisponíveis para este world_size; "
-                  "a ordem dos dados continua exata.")
+            logger.warning("Aviso: estados aleatórios indisponíveis para este world_size; "
+                           "a ordem dos dados continua exata.")
         checkpoint = None
 
-    final_iter, last_losses = train_loop(
-        model, raw_model, optimizer, scaler, ctx, cfg, rt, timing)
+    final_iter, last_losses = train_loop(model, raw_model, optimizer, scaler, ctx, cfg, rt, timing)
 
     save_final_summary(
         cfg, rt, timing, total_params, non_emb_params, final_iter,
@@ -920,3 +908,4 @@ def run(cfg: Config, rt: Runtime) -> None:
 
 if __name__ == "__main__":
     main()
+                                    
