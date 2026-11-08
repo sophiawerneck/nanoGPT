@@ -39,7 +39,7 @@ prepare_data() {
             ( ! -f data/c4/validation.bin &&
               ! -f data/c4/val.bin ) ]]; then
         echo "Preparando o C4..."
-        python prepare_c4.py
+        python data/c4/prepare.py
       else
         echo "Dados do C4 já presentes. Pulando preparação."
       fi
