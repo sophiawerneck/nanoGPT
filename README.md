@@ -91,9 +91,9 @@ Para retomar um treino interrompido a partir do último checkpoint salvo, adicio
 #### Benchmark de Latência
 Após o treinamento, meça a latência de inferência (prefill e geração) para cada modelo salvo:
 ```bash
-python benchmark.py --out_dir out/seq_s1337
-python benchmark.py --out_dir out/inv_s1337
-python benchmark.py --out_dir out/par_s1337
+python bench.py --out_dir out/seq_s1337
+python bench.py --out_dir out/inv_s1337
+python bench.py --out_dir out/par_s1337
 ```
 
 (Repita para as demais sementes).
