@@ -100,7 +100,7 @@ DATASET_PRESETS: dict[str, dict[str, Any]] = {
     ),
 }
 DATASET_HINTS = {
-    'c4': 'python prepare_c4.py',
+    'c4': 'python data/c4/prepare.py',
     'shakespeare_char': 'python data/shakespeare_char/prepare.py',
 }
 
