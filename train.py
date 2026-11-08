@@ -414,8 +414,7 @@ def evaluate_and_save_checkpoint(
     if rt.master:
         sync(rt.device_type)
         t_eval = time.perf_counter()
-        losses = estimate_loss(raw_model, ctx, rt.monitor, cfg.batch_size,
-                               cfg.block_size, rt.device, rt.device_type)
+        losses = estimate_loss(raw_model, ctx, rt.monitor, cfg.batch_size, cfg.block_size, rt.device, rt.device_type)
 
         final_evaluation = iter_num >= cfg.max_iters or cfg.eval_only
         if final_evaluation:
@@ -435,15 +434,13 @@ def evaluate_and_save_checkpoint(
             step_ms, tok_s = float('nan'), float('nan')
 
         if 'val_holdout' in losses:
-            logger.info(f"step {iter_num}: train loss {losses['train']:.4f} | "
-                        f"val monitor loss {losses['val']:.4f} | "
-                        f"val holdout loss {losses['val_holdout']:.4f} | "
-                        f"val holdout ppl {math.exp(losses['val_holdout']):.2f} | "
-                        f"passo {step_ms:.1f} ms | {tok_s:,.0f} tok/s")
+            logger.info("step %d: train loss %.4f | val monitor loss %.4f | val holdout loss %.4f | val holdout ppl %.2f | passo %.1f ms | %s tok/s",
+                        iter_num, losses['train'], losses['val'], losses['val_holdout'],
+                        math.exp(losses['val_holdout']), step_ms, format(tok_s, ',.0f'))
         else:
-            logger.info(f"step {iter_num}: train loss {losses['train']:.4f} | "
-                        f"val loss {losses['val']:.4f} | val ppl {math.exp(losses['val']):.2f} | "
-                        f"passo {step_ms:.1f} ms | {tok_s:,.0f} tok/s")
+            logger.info("step %d: train loss %.4f | val loss %.4f | val ppl %.2f | passo %.1f ms | %s tok/s",
+                        iter_num, losses['train'], losses['val'], math.exp(losses['val']),
+                        step_ms, format(tok_s, ',.0f'))
 
         mfu_count = int(timing.get('mfu_count', 0))
         mfu_mean_percent = (
@@ -482,7 +479,7 @@ def evaluate_and_save_checkpoint(
                 'rng_states': rng_states,
                 'world_size': rt.world_size,
             })
-            logger.info(f"Checkpoint salvo em {rt.checkpoint_path}")
+            logger.info("Checkpoint salvo em %s", rt.checkpoint_path)
 
     if rt.ddp:
         dist.barrier()
@@ -538,7 +535,6 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtim
     last_losses = None
     interval_time, interval_iters = 0.0, 0
 
-    # Closure substituída pela injeção parcial (partial) da função externa pura
     train_batch_fn = partial(train_batch, cfg=cfg, rt=rt)
 
     if rt.master and not cfg.eval_only:
@@ -547,8 +543,7 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtim
             (iter_num % cfg.eval_interval == 0 or iter_num == cfg.max_iters)
             and not (iter_num >= cfg.max_iters and resume_final_losses is not None)
         )
-        prepare_metrics_file(
-            rt.metrics_file, cfg.init_from, iter_num, reevaluates_resume_iter)
+        prepare_metrics_file(rt.metrics_file, cfg.init_from, iter_num, reevaluates_resume_iter)
 
     X, Y = (train_batch_fn(iter_num, 0)
             if iter_num < cfg.max_iters and not cfg.eval_only else (None, None))
@@ -585,9 +580,7 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtim
         sync(rt.device_type)
         t_start = time.perf_counter()
 
-        lossf, X, Y = perform_training_step(
-            iter_num, model, optimizer, scaler, ctx, cfg, rt, train_batch_fn, X, Y
-        )
+        lossf, X, Y = perform_training_step(iter_num, model, optimizer, scaler, ctx, cfg, rt, train_batch_fn, X, Y)
 
         sync(rt.device_type)
         dt = time.perf_counter() - t_start
@@ -614,8 +607,7 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtim
         if iter_num % cfg.log_interval == 0 and rt.master:
             mfu_text = f"{running_mfu * 100:.2f}%" if running_mfu >= 0.0 else "n/a"
             warmup_text = '' if steady else ' (aquecimento)'
-            logger.info(f"iter {iter_num}: loss {lossf:.4f}, tempo {dt * 1000:.2f}ms, "
-                        f"mfu {mfu_text}{warmup_text}")
+            logger.info("iter %d: loss %.4f, tempo %.2fms, mfu %s%s", iter_num, lossf, dt * 1000, mfu_text, warmup_text)
 
         iter_num += 1
         local_iter += 1
@@ -661,13 +653,12 @@ def print_and_save_run_header(
 ) -> None:
     if rt.master:
         logger.info("==== Iniciando treinamento ====")
-        logger.info(f"Variante: {cfg.block_type.upper()} | semente: {cfg.seed} | world_size: {rt.world_size}")
-        logger.info(f"Tokens por iteração: {tokens_per_iter:,}")
-        logger.info(f"Parâmetros: {total_params:,} totais | {non_emb_params:,} sem embeddings")
-        logger.info(f"Tokens planejados: {planned_tokens:,} | tokens/parâmetro: {planned_tokens / total_params:.2f}")
-        logger.info(f"Janelas de treino: {n_train:,} | épocas planejadas: {planned_epochs:.4f}")
-        logger.info(f"Validação: {cfg.val_monitor_windows:,} janelas de monitoramento | "
-                    f"{cfg.val_holdout_windows:,} janelas reservadas para avaliação final")
+        logger.info("Variante: %s | semente: %d | world_size: %d", cfg.block_type.upper(), cfg.seed, rt.world_size)
+        logger.info("Tokens por iteração: %s", format(tokens_per_iter, ','))
+        logger.info("Parâmetros: %s totais | %s sem embeddings", format(total_params, ','), format(non_emb_params, ','))
+        logger.info("Tokens planejados: %s | tokens/parâmetro: %.2f", format(planned_tokens, ','), planned_tokens / total_params)
+        logger.info("Janelas de treino: %s | épocas planejadas: %.4f", format(n_train, ','), planned_epochs)
+        logger.info("Validação: %s janelas de monitoramento | %s janelas reservadas para avaliação final", format(cfg.val_monitor_windows, ','), format(cfg.val_holdout_windows, ','))
 
         if not cfg.eval_only:
             run_info = {
@@ -685,8 +676,7 @@ def print_and_save_run_header(
                 'world_size': rt.world_size,
                 'environment': environment_info(),
             }
-            name = ('config.json' if cfg.init_from == 'scratch'
-                    else f'config_resume_{cfg.start_iter}.json')
+            name = ('config.json' if cfg.init_from == 'scratch' else f'config_resume_{cfg.start_iter}.json')
             write_json(os.path.join(cfg.out_dir, name), run_info)
 
 
@@ -737,8 +727,7 @@ def save_final_summary(
             'gpu': environment_info().get('gpu_name'),
         }
         write_json(os.path.join(cfg.out_dir, 'summary.json'), summary)
-        logger.info(f"Resumo salvo em {os.path.join(cfg.out_dir, 'summary.json')}")
-
+        logger.info("Resumo salvo em %s", os.path.join(cfg.out_dir, 'summary.json'))
 
 def run(cfg: Config, rt: Runtime) -> None:
     if rt.ddp:
@@ -849,7 +838,7 @@ def run(cfg: Config, rt: Runtime) -> None:
                 }
 
         if rt.master:
-            logger.info(f"Retomando a partir da iteração {cfg.start_iter}.")
+            logger.info("Retomando a partir da iteração %d.", cfg.start_iter)
     cfg.model_args = model_args
 
     model = GPT(GPTConfig(**model_args))
