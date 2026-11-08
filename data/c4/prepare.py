@@ -35,14 +35,14 @@ Reprodutibilidade:
   membro confira se tem exatamente o mesmo arquivo.
 
 Uso:
-  python prepare_c4.py                 # prepara train e validation (retoma se houver progresso)
-  python prepare_c4.py --no_resume     # recomeça do zero
-  python prepare_c4.py --verify_only   # só verifica os .bin existentes (inclui SHA-256)
+  python prepare.py                    # prepara train e validation (retoma se houver progresso)
+  python prepare.py --no_resume        # recomeça do zero
+  python prepare.py --verify_only      # só verifica os .bin existentes (inclui SHA-256)
 """
+from __future__ import annotations
 
 import os
 import sys
-import argparse
 import hashlib
 import itertools
 from collections import deque
@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from simple_parsing import ArgumentParser
 from common import TOKEN_DTYPE, write_json, read_json
 
 
@@ -58,7 +59,7 @@ class C4Config:
     dataset_name: str = "allenai/c4"
     dataset_config: str = "en"
     tokenizer_name: str = "gpt2"
-    split_limits: dict = field(default_factory=lambda: {
+    split_limits: dict[str, int] = field(default_factory=lambda: {
         "train": 3_000_000_000,
         "validation": 100_000_000,
     })
@@ -68,10 +69,30 @@ class C4Config:
     flush_tokens: int = 10_000_000
     resume_check_docs: int = 100
     base_dir: str = field(default_factory=lambda: os.path.dirname(os.path.abspath(__file__)))
+    
+    # --- Flags de Execução (Migradas do argparse para cá) ---
+    splits: list[str] = field(default_factory=lambda: ["train", "validation"])
+    num_threads: int = field(default_factory=lambda: os.cpu_count() or 1)
+    no_resume: bool = False
+    skip_sanity: bool = False
+    verify_only: bool = False
+    verify_docs: int = 200
+    revision: str | None = None
+    
     output_dir: str = field(init=False)
 
     def __post_init__(self):
         self.output_dir = os.path.join(self.base_dir, "data", "c4")
+        
+        if self.num_threads <= 0:
+            raise ValueError("--num_threads deve ser positivo")
+        if self.verify_docs < 0:
+            raise ValueError("--verify_docs não pode ser negativo")
+        for split in self.splits:
+            if split not in self.split_limits:
+                raise ValueError(
+                    f"Split inválido: '{split}'. As opções válidas são: {list(self.split_limits.keys())}"
+                )
 
 
 class ResumeError(RuntimeError):
@@ -92,7 +113,7 @@ def resolve_revision(cfg: C4Config):
 
 
 def stream_texts(cfg: C4Config, split, revision, shuffle=True):
-    """Fluxo determinístico de textos: mesmo commit + mesma semente -> mesma ordem."""
+    """mesmo commit + mesma semente -> mesma ordem."""
     from datasets import load_dataset
 
     ds = load_dataset(cfg.dataset_name, cfg.dataset_config, split=split,
@@ -367,27 +388,20 @@ def verify_split(cfg: C4Config, enc, split, texts_factory, num_docs=200):
 
 
 def main():
-    cfg = C4Config()
-    
-    parser = argparse.ArgumentParser(description="Preparação do C4 (en) com tokenizador GPT-2")
-    parser.add_argument("--splits", nargs="+", default=list(cfg.split_limits), choices=list(cfg.split_limits))
-    parser.add_argument("--num_threads", type=int, default=os.cpu_count() or 1)
-    parser.add_argument("--no_resume", action="store_true")
-    parser.add_argument("--skip_sanity", action="store_true")
-    parser.add_argument("--verify_only", action="store_true")
-    parser.add_argument("--verify_docs", type=int, default=200)
-    parser.add_argument("--revision", default=None,
-                        help="commit do dataset no Hub (padrão: o registrado no estado, "
-                             "ou o atual na primeira execução)")
+    # Inicialização substituída: o simple_parsing mapeia os args do terminal
+    # diretamente para os atributos da dataclass C4Config
+    parser = ArgumentParser(description="Preparação do C4 (en) com tokenizador GPT-2")
+    parser.add_arguments(C4Config, dest="cfg")
     args = parser.parse_args()
+    cfg: C4Config = args.cfg
 
     os.makedirs(cfg.output_dir, exist_ok=True)
     enc = get_encoder(cfg)
     print(f"Tokenizador: {cfg.tokenizer_name} | vocabulário: {enc.n_vocab:,} | EOT: {enc.eot_token}")
 
-    revision = args.revision
-    if revision is None and not args.no_resume:
-        for split in args.splits:
+    revision = cfg.revision
+    if revision is None and not cfg.no_resume:
+        for split in cfg.splits:
             for name in (f"{split}.state.json", f"{split}_meta.json"):
                 path = os.path.join(cfg.output_dir, name)
                 if os.path.exists(path):
@@ -400,20 +414,20 @@ def main():
     if revision is None:
         revision = resolve_revision(cfg)
     print(f"Dataset: {cfg.dataset_name}/{cfg.dataset_config} @ {revision}")
-    print(f"Threads de tokenização: {args.num_threads}")
+    print(f"Threads de tokenização: {cfg.num_threads}")
 
-    if not args.skip_sanity and not args.verify_only:
+    if not cfg.skip_sanity and not cfg.verify_only:
         print("Teste de sanidade (1.000 documentos de treino)...")
         sanity_check(cfg, enc, itertools.islice(stream_texts(cfg, "train", revision, shuffle=False), 1000),
-                     args.num_threads)
+                     cfg.num_threads)
 
-    for split in args.splits:
+    for split in cfg.splits:
         factory = lambda s=split: stream_texts(cfg, s, revision, shuffle=True)
-        if not args.verify_only:
+        if not cfg.verify_only:
             print(f"\nPreparando {split}...")
             prepare_split(cfg, enc, split, cfg.split_limits[split], factory,
-                          args.num_threads, revision, resume=not args.no_resume)
-        verify_split(cfg, enc, split, factory, num_docs=args.verify_docs)
+                          cfg.num_threads, revision, resume=not cfg.no_resume)
+        verify_split(cfg, enc, split, factory, num_docs=cfg.verify_docs)
 
     print("\nPreparação do C4 concluída.")
 
