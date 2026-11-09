@@ -134,7 +134,7 @@ METRIC_COLUMNS = [
 @dataclass
 class Config:
     """Configuração da execução: Única Fonte de Verdade para argumentos e validação."""
-    block_type: str = "seq"  # opções: 'seq', 'inv', 'par'
+    block_type: str = "seq"  # opções: 'seq', 'inv', 'par', 'par_shared
     init_from: str = "scratch"  # opções: 'scratch', 'resume'
     seed: int = 1337
     out_dir: str | None = None
@@ -186,8 +186,8 @@ class Config:
     _resume_final_losses: dict[str, float] | None = field(default=None, init=False)
 
     def __post_init__(self):
-        if self.block_type not in ["seq", "inv", "par"]:
-            raise ValueError(f"--block_type deve ser 'seq', 'inv' ou 'par'. Recebido: {self.block_type}")
+        if self.block_type not in ["seq", "inv", "par", "par_shared"]:
+            raise ValueError(f"--block_type deve ser 'seq', 'inv', 'par' ou 'par_shared'. Recebido: {self.block_type}")
         if self.init_from not in ["scratch", "resume"]:
             raise ValueError(f"--init_from deve ser 'scratch' ou 'resume'. Recebido: {self.init_from}")
         if self.dtype is not None and self.dtype not in ["float32", "bfloat16", "float16"]:
