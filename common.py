@@ -15,6 +15,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).absolute().parent
 OUTPUT_DIR = BASE_DIR.parent / "output"
+INPUT_DIR = BASE_DIR.parent / "input"
 
 def file_sha256(path, chunk_bytes=64 * 1024 * 1024):
     h = hashlib.sha256()
