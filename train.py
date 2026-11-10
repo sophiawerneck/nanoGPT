@@ -633,7 +633,7 @@ def main() -> None:
     if cfg.data_dir is None:
         cfg.data_dir = os.path.join(BASE_DIR, 'data', cfg.dataset)
     if cfg.out_dir is None:
-        cfg.out_dir = os.path.join(BASE_DIR, 'out', cfg.dataset, f'{cfg.block_type}_s{cfg.seed}')
+        cfg.out_dir = os.path.join(OUTPUT_DIR, cfg.dataset, f'{cfg.block_type}_s{cfg.seed}')
 
     rt = Runtime()
     rt.ddp = int(os.environ.get('RANK', -1)) != -1
