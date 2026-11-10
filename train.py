@@ -1,4 +1,13 @@
-"""Treinamento das variantes de bloco (seq, inv, par) do GPT (~124M) no C4.
+"""Treinamento das variantes de bloco (seq, inv, par, par_shared) do GPT (~124M) no C4.
+
+Variantes (definidas em model.py; mesmos tensores e mesma inicialização por
+semente, exceto pela LayerNorm que par_shared não instancia):
+- seq: atenção e depois FFN (baseline).
+- inv: FFN e depois atenção. Na pilha completa equivale a seq com a última FFN
+  movida para antes da primeira atenção.
+- par: atenção e FFN somadas em paralelo, cada ramo com sua LayerNorm.
+- par_shared: os dois ramos leem a mesma LayerNorm; é a formulação paralela de
+  Chowdhery et al. (PaLM, JMLR 2023).
 
 Fluxo de Funcionamento:
 - Inicialização e configuração: Valida hiperparâmetros, configura o ambiente 
@@ -29,9 +38,13 @@ Retomada:
   python train.py --block_type seq --seed 1337 --init_from resume
 
 Escolhas metodológicas:
-- Hiperparâmetros do GPT-3 Small (Brown et al., NeurIPS 2020): ~0,5M tokens
-  por passo, lr 6e-4, AdamW (Loshchilov & Hutter, ICLR 2019) com
+- Otimizador e LR de pico do GPT-3 Small (Brown et al., NeurIPS 2020): ~0,5M
+  tokens por passo, lr 6e-4, AdamW (Loshchilov & Hutter, ICLR 2019) com
   beta=(0,9; 0,95), weight decay 0,1, clipping 1,0, decaimento cosseno até 10%.
+  O cronograma NÃO é o do artigo: foi reescalonado para o orçamento de ~3B
+  tokens. Aqui o warmup dura 200 passos (~98M tokens, contra 375M no artigo) e
+  o cosseno cobre todo o treino (contra 260B tokens), com lote constante (o
+  artigo aumenta o lote nos primeiros 4-12B tokens) e contexto de 1024 tokens.
 - Orçamento de ~3B tokens para ~124M parâmetros (~24 tokens/parâmetro), perto
   do ótimo computacional de ~20 de Hoffmann et al. (NeurIPS 2022).
 - Amostragem sem reposição: o train.bin é dividido em janelas não sobrepostas
@@ -39,13 +52,33 @@ Escolhas metodológicas:
   numa permutação definida pela semente. Como as janelas não se sobrepõem,
   cada token aparece como entrada no máximo uma vez por época; os tokens
   restantes no fim do arquivo (menos de uma janela) não são usados. O
-  orçamento cobre menos de uma época, então não há repetição de dados, o que
-  evita o efeito da repetição sobre a perda (Muennighoff et al., NeurIPS 2023).
+  orçamento cobre menos de uma época, então não há repetição de dados. Isso
+  segue Brown et al. (dados amostrados sem reposição) e elimina a repetição
+  como variável de confusão; é uma escolha de controle experimental, não de
+  ganho: Muennighoff et al. (NeurIPS 2023) indicam que até ~4 épocas a
+  repetição quase não altera a perda.
   Mesma semente = mesma ordem de dados em todas as variantes (comparação
   pareada).
 - Monitoramento em subconjuntos fixos de treino e validação; as janelas de
   validação a partir de val_monitor_windows ficam reservadas para a avaliação
-  final.
+  final. O subconjunto de treino é uma amostra fixa de janelas do train.bin:
+  no passo t, só a fração ~t/max_iters delas já foi vista, então a coluna
+  train_loss mistura dados vistos e inéditos e a diferença para val_loss não
+  mede memorização. A curva de treino propriamente dita é train_online_loss:
+  a média da perda dos lotes de treino do intervalo, que em menos de uma época
+  são sempre dados inéditos (no DDP, média dos micro-lotes do rank 0).
+- Avaliação final: além da perda média, a perda de cada janela do holdout é
+  salva em val_holdout_window_losses.npy, para o bootstrap pareado por janela
+  entre variantes feito em summarize.py.
+- Protocolo do holdout: a métrica primária usa janelas disjuntas de block_size
+  tokens (passo = block_size), como no treino; cada token é pontuado uma vez,
+  com 0 a block_size - 1 tokens de contexto (~block_size/2 em média). Ela é
+  pessimista em relação à janela deslizante e não é comparável a valores
+  publicados com esse outro protocolo. Como verificação de robustez, a
+  avaliação final calcula também val_holdout_strided: os mesmos tokens com
+  janela deslizante de passo block_size/2, pontuando só a segunda metade de
+  cada janela (todo token com pelo menos block_size/2 de contexto), e salva a
+  loss média por posição na janela em val_holdout_position_losses.npy.
 - Tempo de passo medido com sincronização da GPU, excluindo a avaliação e as
   primeiras iterações de cada processo (compilação e aquecimento).
 
@@ -73,6 +106,7 @@ from typing import Any, Callable
 import pickle
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
@@ -82,7 +116,7 @@ from model import GPTConfig, GPT
 from common import (
     BASE_DIR, INPUT_DIR, OUTPUT_DIR, count_windows, load_windows, default_dtype, autocast_ctx, sync,
     strip_compile_prefix, count_params, environment_info, write_json, read_json,
-    file_sha256,
+    file_sha256, TOKEN_DTYPE,
 )
 
 logger = logging.getLogger(__name__)
@@ -129,12 +163,16 @@ METRIC_COLUMNS = [
     'eval_time_s',
     'mfu_mean_percent',
     'val_holdout_ppl',
+    'train_online_loss',
 ]
+
+HOLDOUT_WINDOW_LOSSES_FILE = 'val_holdout_window_losses.npy'
+HOLDOUT_POSITION_LOSSES_FILE = 'val_holdout_position_losses.npy'
 
 @dataclass
 class Config:
     """Configuração da execução: Única Fonte de Verdade para argumentos e validação."""
-    block_type: str = "seq"  # opções: 'seq', 'inv', 'par', 'par_shared
+    block_type: str = "seq"  # opções: 'seq', 'inv', 'par', 'par_shared'
     init_from: str = "scratch"  # opções: 'scratch', 'resume'
     seed: int = 1337
     out_dir: str | None = None
@@ -145,6 +183,9 @@ class Config:
     log_interval: int = 1
     eval_iters: int = 200
     eval_only: bool = False
+    # Não avalia o holdout (usado na varredura de LR, cuja seleção deve usar
+    # apenas o subconjunto de monitoramento).
+    skip_holdout: bool = False
     stop_iter: int | None = None
 
     grad_accum: int = 40  # 5 * 8
@@ -298,8 +339,14 @@ def dataset_vocab_size(data_dir: str) -> int:
 @torch.no_grad()
 def estimate_loss(model: torch.nn.Module, ctx, monitor: dict[str, tuple[str, np.ndarray]],
                   batch_size: int, block_size: int, device: str,
-                  device_type: str) -> dict[str, float]:
-    """Calcula a loss média ponderada em subconjuntos fixos de janelas."""
+                  device_type: str,
+                  per_window: dict[str, np.ndarray] | None = None) -> dict[str, float]:
+    """Calcula a loss média ponderada em subconjuntos fixos de janelas.
+
+    Se per_window for um dicionário, recebe também, para cada subconjunto, a
+    loss de cada janela na ordem de ids (chave split) e a loss média de cada
+    posição dentro da janela (chave split + '_by_position').
+    """
     out = {}
     was_training = model.training
     model.eval()
@@ -307,20 +354,71 @@ def estimate_loss(model: torch.nn.Module, ctx, monitor: dict[str, tuple[str, np.
         for split, (path, ids) in monitor.items():
             total_loss = 0.0
             total_windows = 0
+            window_losses = [] if per_window is not None else None
+            position_sum = torch.zeros(block_size, dtype=torch.float64)
             for k in range(0, len(ids), batch_size):
                 batch_ids = ids[k:k + batch_size]
                 X, Y = load_windows(path, batch_ids, block_size, device, device_type)
                 with ctx:
-                    _, loss = model(X, Y)
+                    logits, loss = model(X, Y)
+                    if window_losses is not None:
+                        token_losses = F.cross_entropy(
+                            logits.view(-1, logits.size(-1)), Y.view(-1), reduction='none'
+                        ).view(Y.shape).float()
+                        window_losses.append(token_losses.mean(dim=1).cpu())
+                        position_sum += token_losses.sum(dim=0).double().cpu()
                 batch_windows = len(batch_ids)
                 total_loss += loss.item() * batch_windows
                 total_windows += batch_windows
             if total_windows == 0:
                 raise ValueError(f"O subconjunto '{split}' não contém janelas para avaliação.")
             out[split] = total_loss / total_windows
+            if window_losses is not None:
+                per_window[split] = torch.cat(window_losses).numpy()
+                per_window[split + '_by_position'] = (position_sum / total_windows).numpy()
     finally:
         model.train(was_training)
     return out
+
+
+@torch.no_grad()
+def estimate_strided_loss(model: torch.nn.Module, ctx, path: str, first_window: int,
+                          num_windows: int, batch_size: int, block_size: int,
+                          device: str, device_type: str) -> float:
+    """Loss média por token com janela deslizante de passo block_size // 2.
+
+    Avalia exatamente os mesmos tokens-alvo das janelas disjuntas first_window,
+    ..., first_window + num_windows - 1, mas cada janela avança meio bloco e só
+    a segunda metade é pontuada. Assim todo token pontuado tem pelo menos
+    block_size // 2 tokens de contexto, em vez de 0 a block_size - 1. A primeira
+    janela começa meio bloco antes da região, usando como contexto (sem
+    pontuar) tokens que a antecedem no mesmo arquivo; exige first_window >= 1.
+    """
+    stride = block_size // 2
+    context = block_size - stride
+    region_start = first_window * block_size
+    starts = region_start - context + stride * np.arange(num_windows * block_size // stride)
+    total_loss, total_tokens = 0.0, 0
+    was_training = model.training
+    model.eval()
+    try:
+        for k in range(0, len(starts), batch_size):
+            # Memmap recriado a cada lote, como em common.load_windows.
+            data = np.memmap(path, dtype=TOKEN_DTYPE, mode='r')
+            chunks = [torch.from_numpy(data[s:s + block_size + 1].astype(np.int64))
+                      for s in starts[k:k + batch_size]]
+            X = torch.stack([c[:-1] for c in chunks]).to(device)
+            Y = torch.stack([c[1:] for c in chunks]).to(device)
+            with ctx:
+                logits, _ = model(X, Y)
+                scored = F.cross_entropy(
+                    logits[:, context:, :].reshape(-1, logits.size(-1)),
+                    Y[:, context:].reshape(-1), reduction='sum')
+            total_loss += scored.item()
+            total_tokens += Y[:, context:].numel()
+    finally:
+        model.train(was_training)
+    return total_loss / total_tokens
   
 def get_lr(it: int, warmup_iters: int, lr_decay_iters: int, learning_rate: float,
            min_lr: float) -> float:
@@ -381,11 +479,17 @@ def new_timing() -> dict[str, float]:
         'mfu_sum': 0.0,
         'mfu_sq_sum': 0.0,
         'mfu_count': 0,
+        'peak_memory_mb': 0.0,
     }
 
 
-def prepare_metrics_file(metrics_file: str, init_from: str, resume_iter: int, reevaluates_resume_iter: bool) -> None:
+def prepare_metrics_file(metrics_file: str, init_from: str, resume_iter: int,
+                         reevaluates_resume_iter: bool) -> float | None:
+    """Reescreve o CSV mantendo as linhas anteriores à retomada. Retorna a
+    train_online_loss da linha de resume_iter quando ela será reavaliada: o
+    intervalo que ela resume terminou antes da retomada e não pode ser refeito."""
     previous_rows = []
+    resume_online_loss = None
     limit = resume_iter if reevaluates_resume_iter else resume_iter + 1
     if init_from == 'resume' and os.path.exists(metrics_file):
         with open(metrics_file, 'r', newline='') as f:
@@ -393,18 +497,21 @@ def prepare_metrics_file(metrics_file: str, init_from: str, resume_iter: int, re
                 try:
                     if int(row['iter']) < limit:
                         previous_rows.append(row)
-                except (ValueError, KeyError):
+                    elif int(row['iter']) == resume_iter:
+                        resume_online_loss = float(row['train_online_loss'])
+                except (ValueError, KeyError, TypeError):
                     continue
     with open(metrics_file, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=METRIC_COLUMNS, extrasaction='ignore')
         writer.writeheader()
         writer.writerows(previous_rows)
+    return resume_online_loss
 
 
 def evaluate_and_save_checkpoint(
     iter_num: int, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtime,
     timing: dict[str, float], lr: float, interval_time: float, interval_iters: int,
-    tokens_per_iter: int
+    tokens_per_iter: int, interval_train_loss: float | None = None
 ) -> dict[str, float] | None:
     if rt.ddp:
         dist.barrier()
@@ -413,16 +520,36 @@ def evaluate_and_save_checkpoint(
 
     if rt.master:
         sync(rt.device_type)
+        if rt.device_type == 'cuda':
+            # Pico de memória do treino (rank 0), lido antes da avaliação e
+            # guardado em timing para sobreviver às retomadas.
+            timing['peak_memory_mb'] = max(
+                timing.get('peak_memory_mb', 0.0),
+                torch.cuda.max_memory_allocated(rt.device) / 2 ** 20)
         t_eval = time.perf_counter()
         losses = estimate_loss(raw_model, ctx, rt.monitor, cfg.batch_size, cfg.block_size, rt.device, rt.device_type)
 
-        final_evaluation = iter_num >= cfg.max_iters or cfg.eval_only
+        final_evaluation = (iter_num >= cfg.max_iters or cfg.eval_only) and not cfg.skip_holdout
         if final_evaluation:
+            per_window = {}
             holdout_losses = estimate_loss(
                 raw_model, ctx, {'val_holdout': rt.val_holdout}, cfg.batch_size,
-                cfg.block_size, rt.device, rt.device_type
+                cfg.block_size, rt.device, rt.device_type, per_window=per_window
             )
             losses.update(holdout_losses)
+            if iter_num >= cfg.max_iters:
+                # Só o checkpoint final gera o arquivo usado no bootstrap pareado.
+                np.save(os.path.join(cfg.out_dir, HOLDOUT_WINDOW_LOSSES_FILE),
+                        per_window['val_holdout'].astype(np.float32))
+                np.save(os.path.join(cfg.out_dir, HOLDOUT_POSITION_LOSSES_FILE),
+                        per_window['val_holdout_by_position'].astype(np.float32))
+            if cfg.block_size % 2 == 0:
+                # Métrica secundária: mesmos tokens, janela deslizante de meio bloco.
+                holdout_path, holdout_ids = rt.val_holdout
+                losses['val_holdout_strided'] = estimate_strided_loss(
+                    raw_model, ctx, holdout_path, int(holdout_ids[0]), len(holdout_ids),
+                    cfg.batch_size, cfg.block_size, rt.device, rt.device_type
+                )
 
         sync(rt.device_type)
         timing['eval_time_s'] += time.perf_counter() - t_eval
@@ -437,6 +564,10 @@ def evaluate_and_save_checkpoint(
             logger.info("step %d: train loss %.4f | val monitor loss %.4f | val holdout loss %.4f | val holdout ppl %.2f | passo %.1f ms | %s tok/s",
                         iter_num, losses['train'], losses['val'], losses['val_holdout'],
                         math.exp(losses['val_holdout']), step_ms, format(tok_s, ',.0f'))
+            if 'val_holdout_strided' in losses:
+                logger.info("step %d: val holdout com janela deslizante (passo %d) loss %.4f | ppl %.2f",
+                            iter_num, cfg.block_size // 2, losses['val_holdout_strided'],
+                            math.exp(losses['val_holdout_strided']))
         else:
             logger.info("step %d: train loss %.4f | val loss %.4f | val ppl %.2f | passo %.1f ms | %s tok/s",
                         iter_num, losses['train'], losses['val'], math.exp(losses['val']),
@@ -462,6 +593,7 @@ def evaluate_and_save_checkpoint(
                     f"{timing['eval_time_s']:.2f}",
                     f"{mfu_mean_percent:.4f}" if mfu_mean_percent != '' else '',
                     f"{holdout_ppl:.2f}" if holdout_ppl != '' else '',
+                    f"{interval_train_loss:.4f}" if interval_train_loss is not None else '',
                 ])
 
         if iter_num > 0 and not cfg.eval_only:
@@ -475,6 +607,7 @@ def evaluate_and_save_checkpoint(
                 'train_loss': losses['train'],
                 'val_loss': losses['val'],
                 'val_holdout_loss': losses.get('val_holdout'),
+                'val_holdout_strided_loss': losses.get('val_holdout_strided'),
                 'timing': dict(timing),
                 'rng_states': rng_states,
                 'world_size': rt.world_size,
@@ -534,6 +667,8 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtim
     running_mfu = -1.0
     last_losses = None
     interval_time, interval_iters = 0.0, 0
+    interval_loss_sum, interval_loss_iters = 0.0, 0
+    resume_online_loss = None
 
     train_batch_fn = partial(train_batch, cfg=cfg, rt=rt)
 
@@ -543,7 +678,8 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtim
             (iter_num % cfg.eval_interval == 0 or iter_num == cfg.max_iters)
             and not (iter_num >= cfg.max_iters and resume_final_losses is not None)
         )
-        prepare_metrics_file(rt.metrics_file, cfg.init_from, iter_num, reevaluates_resume_iter)
+        resume_online_loss = prepare_metrics_file(
+            rt.metrics_file, cfg.init_from, iter_num, reevaluates_resume_iter)
 
     X, Y = (train_batch_fn(iter_num, 0)
             if iter_num < cfg.max_iters and not cfg.eval_only else (None, None))
@@ -567,12 +703,15 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtim
               or stop_here or cfg.eval_only):
             new_losses = evaluate_and_save_checkpoint(
                 iter_num, raw_model, optimizer, scaler, ctx, cfg, rt, timing, lr,
-                interval_time, interval_iters, tokens_per_iter
+                interval_time, interval_iters, tokens_per_iter,
+                interval_loss_sum / interval_loss_iters if interval_loss_iters else resume_online_loss
             )
             if new_losses is not None:
                 last_losses = new_losses
 
             interval_time, interval_iters = 0.0, 0
+            interval_loss_sum, interval_loss_iters = 0.0, 0
+            resume_online_loss = None
 
         if cfg.eval_only or iter_num >= cfg.max_iters or stop_here:
             break
@@ -586,6 +725,8 @@ def train_loop(model, raw_model, optimizer, scaler, ctx, cfg: Config, rt: Runtim
         dt = time.perf_counter() - t_start
 
         timing['train_time_s'] += dt
+        interval_loss_sum += lossf
+        interval_loss_iters += 1
         steady = local_iter >= cfg.timing_warmup_iters
         if steady:
             timing['steady_time_s'] += dt
@@ -659,6 +800,10 @@ def print_and_save_run_header(
         logger.info("Tokens planejados: %s | tokens/parâmetro: %.2f", format(planned_tokens, ','), planned_tokens / total_params)
         logger.info("Janelas de treino: %s | épocas planejadas: %.4f", format(n_train, ','), planned_epochs)
         logger.info("Validação: %s janelas de monitoramento | %s janelas reservadas para avaliação final", format(cfg.val_monitor_windows, ','), format(cfg.val_holdout_windows, ','))
+        if rt.device_type == 'cuda':
+            logger.info("MFU: peak_tflops=%.1f por GPU (%s, dtype %s). Confirme que esse é o pico "
+                        "teórico dessa GPU nessa precisão; caso contrário, passe --peak_tflops.",
+                        cfg.peak_tflops, environment_info().get('gpu_name'), cfg.dtype)
 
         if not cfg.eval_only:
             run_info = {
@@ -712,14 +857,23 @@ def save_final_summary(
             'params_non_embedding': non_emb_params,
             'train_time_s': timing['train_time_s'],
             'step_time_ms_mean': mean_s * 1000,
+            'step_time_ms_std': std_s * 1000,
             'tokens_per_s': tokens_per_iter / mean_s if n else float('nan'),
+            'peak_memory_mb': timing.get('peak_memory_mb') or None,
+            'dtype': cfg.dtype,
             'mfu_mean_percent': mfu_mean_percent,
             'mfu_std_percent': mfu_std_percent,
             'mfu_peak_tflops_per_gpu': cfg.peak_tflops,
+            'monitor_val_loss_final': last_losses.get('val') if last_losses else None,
+            'val_holdout_loss_final': last_losses.get('val_holdout') if last_losses else None,
             'val_holdout_ppl_final': (
                 math.exp(last_losses['val_holdout'])
                 if last_losses and 'val_holdout' in last_losses else None
             ),
+            'val_holdout_strided_loss_final': (
+                last_losses.get('val_holdout_strided') if last_losses else None
+            ),
+            'val_holdout_strided_stride': cfg.block_size // 2,
             'val_monitor_windows': cfg.val_monitor_windows,
             'val_holdout_windows': cfg.val_holdout_windows,
             'world_size': rt.world_size,
@@ -843,6 +997,8 @@ def run(cfg: Config, rt: Runtime) -> None:
                     'val': saved_val_loss,
                     'val_holdout': saved_holdout_loss,
                 }
+                if checkpoint.get('val_holdout_strided_loss') is not None:
+                    cfg._resume_final_losses['val_holdout_strided'] = checkpoint['val_holdout_strided_loss']
 
         if rt.master:
             logger.info("Retomando a partir da iteração %d.", cfg.start_iter)
