@@ -4,6 +4,8 @@ import json
 import time
 import argparse
 from contextlib import nullcontext
+from pathlib import Path
+from common import OUTPUT_DIR
 
 import torch
 from model import GPTConfig, GPT
@@ -11,7 +13,7 @@ from model import GPTConfig, GPT
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark inference latency")
-    parser.add_argument('--out_dir', type=str, default='out')
+    parser.add_argument('--out_dir', type=str, default=str(OUTPUT_DIR / 'c4' / 'seq_s1337'))
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument(
         '--dtype', type=str, default=None,
