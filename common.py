@@ -9,9 +9,12 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKEN_DTYPE = np.uint16  
 
+from pathlib import Path
+
+BASE_DIR = Path(__file__).absolute().parent
+OUTPUT_DIR = BASE_DIR.parent / "output"
 
 def file_sha256(path, chunk_bytes=64 * 1024 * 1024):
     h = hashlib.sha256()
