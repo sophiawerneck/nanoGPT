@@ -4,3 +4,4 @@ tiktoken
 requests
 simple-parsing
 huggingface_hub
+datasets
