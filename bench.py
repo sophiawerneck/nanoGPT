@@ -4,8 +4,6 @@ import json
 import time
 import argparse
 from contextlib import nullcontext
-from pathlib import Path
-from common import OUTPUT_DIR
 import logging
 
 import torch
@@ -38,8 +36,6 @@ def main():
     args = parse_args()
     out_dir = args.out_dir
 
-    os.makedirs(out_dir, exist_ok=True)
-
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"Checkpoint não encontrado: {ckpt_path}")
@@ -60,6 +56,7 @@ def main():
         force=True
     )
     logger = logging.getLogger(__name__)
+    device = torch.device(args.device)
     if device.type not in ('cpu', 'cuda'):
         raise ValueError("--device deve indicar 'cpu' ou 'cuda' (por exemplo, cuda:0).")
     if device.type == 'cuda':
@@ -70,7 +67,8 @@ def main():
                 f"Dispositivo {device} inexistente; GPUs disponíveis: "
                 f"{torch.cuda.device_count()}."
             )
-        torch.cuda.set_device(device)
+        if device.index is not None:
+            torch.cuda.set_device(device)
 
     torch.manual_seed(args.seed)
     if device.type == 'cuda':
