@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import matplotlib.pyplot as plt
 import pandas as pd
 from simple_parsing import ArgumentParser
+from common import OUTPUT_DIR
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,8 +66,7 @@ TRAINING_QUALITY_METRICS = [
 
 @dataclass
 class SummarizeConfig:
-    out_root: str 
-
+    out_root: str = str(OUTPUT_DIR / "c4")
 
 def load_json(path: Path) -> dict:
     with path.open('r', encoding='utf-8') as file:
