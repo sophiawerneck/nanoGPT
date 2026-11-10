@@ -51,7 +51,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from simple_parsing import ArgumentParser
-from common import TOKEN_DTYPE, write_json, read_json
+from common import INPUT_DIR, TOKEN_DTYPE, write_json, read_json
 
 
 @dataclass
@@ -82,8 +82,7 @@ class C4Config:
     output_dir: str = field(init=False)
 
     def __post_init__(self):
-        self.output_dir = os.path.join(self.base_dir, "data", "c4")
-        
+        self.output_dir = str(INPUT_DIR / "c4")
         if self.num_threads <= 0:
             raise ValueError("--num_threads deve ser positivo")
         if self.verify_docs < 0:
