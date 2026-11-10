@@ -20,7 +20,7 @@ def parse_args():
     )
     parser.add_argument('--compile', action='store_true')
     parser.add_argument('--max_new_tokens', type=int, default=200)
-    parser.add_argument('--num_samples', type=int, default=5)
+    parser.add_argument('--num_samples', type=int, default=100)
     parser.add_argument('--seed', type=int, default=1337)
     args = parser.parse_args()
 
@@ -150,12 +150,13 @@ def main():
     logger.info("Warming up...")
     with torch.no_grad():
         with ctx:
-            _ = model.generate(
-                x,
-                max_new_tokens=args.max_new_tokens,
-                temperature=0.8,
-                top_k=200
-            )
+            for _ in range(10):
+                _ = model.generate(
+                    x,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=0.8,
+                    top_k=200
+                )
     synchronize()
 
     logger.info("Benchmarking...")
