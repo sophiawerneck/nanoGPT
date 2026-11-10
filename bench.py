@@ -40,6 +40,12 @@ def main():
 
     os.makedirs(out_dir, exist_ok=True)
 
+    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint não encontrado: {ckpt_path}")
+
+    os.makedirs(out_dir, exist_ok=True)
+
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
@@ -54,11 +60,6 @@ def main():
         force=True
     )
     logger = logging.getLogger(__name__)
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    if not os.path.isfile(ckpt_path):
-        raise FileNotFoundError(f"Checkpoint não encontrado: {ckpt_path}")
-
-    device = torch.device(args.device)
     if device.type not in ('cpu', 'cuda'):
         raise ValueError("--device deve indicar 'cpu' ou 'cuda' (por exemplo, cuda:0).")
     if device.type == 'cuda':
