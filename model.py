@@ -95,11 +95,17 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self.block_type = getattr(config, 'block_type', 'seq')
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        # 'par_shared' usa uma única LayerNorm para os dois ramos. ln_2 não é
+        # instanciada nesse caso: ficaria sem uso e sem gradiente, inflando a
+        # contagem de parâmetros e quebrando o DDP (parâmetros fora do grafo).
+        # LayerNorm não consome números aleatórios na criação, então a
+        # inicialização dos demais pesos continua idêntica entre as variantes.
+        self.ln_2 = (LayerNorm(config.n_embd, bias=config.bias)
+                     if self.block_type != 'par_shared' else None)
         self.mlp = MLP(config)
-        self.block_type = getattr(config, 'block_type', 'seq')
 
     def forward(self, x):
         if self.block_type == 'seq':
@@ -107,16 +113,21 @@ class Block(nn.Module):
             x = x + self.attn(self.ln_1(x))
             x = x + self.mlp(self.ln_2(x))
         elif self.block_type == 'inv':
-            # Invertido: FFN -> MHA
+            # Invertido: FFN -> MHA. Na pilha completa, equivale a 'seq' com a
+            # última FFN movida para antes da primeira atenção; as subcamadas
+            # intermediárias alternam exatamente como no baseline.
             x = x + self.mlp(self.ln_1(x))
             x = x + self.attn(self.ln_2(x))
         elif self.block_type == 'par':
-            # Paralelo: MHA || FFN (soma das duas saídas)
+            # Paralelo com duas normas: MHA || FFN, cada ramo com sua LayerNorm.
             x = x + self.attn(self.ln_1(x)) + self.mlp(self.ln_2(x))
         elif self.block_type == 'par_shared':
-            # Paralelo: MHA || FFN (soma das duas saídas)
+            # Paralelo com norma compartilhada: os dois ramos leem a mesma
+            # LayerNorm. É a formulação paralela de Chowdhery et al. (PaLM,
+            # JMLR 2023): y = x + MLP(LN(x)) + Attn(LN(x)). 'par' é a variante
+            # dela com uma norma por ramo.
             h = self.ln_1(x)
-            x = x + self.attn(h) + self.mlp(h) # acho que assim implementando o layer norm 1 vez só q leva ao paralelo de fato ?
+            x = x + self.attn(h) + self.mlp(h)
         else:
             raise ValueError(f"block_type desconhecido: {self.block_type}")
         return x
@@ -130,7 +141,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    block_type: str = 'seq'  # 'seq' | 'inv' | 'par'
+    block_type: str = 'seq'  # 'seq' | 'inv' | 'par' | 'par_shared'
 
 class GPT(nn.Module):
 
