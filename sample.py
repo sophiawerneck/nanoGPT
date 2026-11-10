@@ -37,7 +37,8 @@ class SampleConfig:
     temperature: float = 0.8
     top_k: int = 200
     seed: int = 1337
-    device: str = 'cuda'
+    device: str = 'cuda:0'
+
     dtype: str | None = None
     compile: bool = False
 
