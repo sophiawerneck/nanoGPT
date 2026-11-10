@@ -24,13 +24,30 @@
 #   TRAIN_ARGS=""            argumentos extras para train.py (ex.: --peak_tflops 989)
 
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "${BASH_SOURCE[0]}")"
 
 DATASET="${DATASET:-c4}"
 SEEDS="${SEEDS:-1337 1338 1339}"
 VARIANTS="${VARIANTS:-seq inv par}"
 NPROC="${NPROC:-1}"
 TRAIN_ARGS="${TRAIN_ARGS:-}"
+
+OUTPUT_DIR="$(python -c 'from common import OUTPUT_DIR; print(OUTPUT_DIR)')"
+DATASET_OUT="${OUTPUT_DIR}/${DATASET}"
+
+mkdir -p "$DATASET_OUT"
+exec > >(tee -a "${DATASET_OUT}/run_all.log") 2>&1
+
+echo "Diretório de saída: ${DATASET_OUT}"
+echo "Dataset: ${DATASET}"
+echo "Sementes: ${SEEDS}"
+echo "Variantes: ${VARIANTS}"
+echo "NPROC: ${NPROC}"
+
+EXTRA_TRAIN_ARGS=()
+if [[ -n "$TRAIN_ARGS" ]]; then
+  read -r -a EXTRA_TRAIN_ARGS <<< "$TRAIN_ARGS"
+fi
 
 prepare_data() {
   case "$DATASET" in
@@ -67,7 +84,7 @@ prepare_data() {
 train_and_evaluate() {
   local seed="$1"
   local variant="$2"
-  local out="out/${DATASET}/${variant}_s${seed}"
+  local out="${DATASET_OUT}/${variant}_s${seed}"
 
   if [[ -f "$out/summary.json" ]]; then
     echo ">> $out já treinado."
@@ -97,7 +114,7 @@ train_and_evaluate() {
 }
 
 summarize_results() {
-  python summarize.py --out_root "out/${DATASET}"
+  python summarize.py --out_root "$DATASET_OUT"
 }
 
 main() {
@@ -115,6 +132,11 @@ main() {
   done
 
   summarize_results
+
+  echo "Pipeline concluído."
+  echo "Resultados salvos em: $DATASET_OUT"
 }
+
+main "$@"
 
 main "$@"
