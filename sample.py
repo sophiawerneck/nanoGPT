@@ -9,6 +9,8 @@ import pickle
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
+from pathlib import Path
+from common import OUTPUT_DIR
 
 import torch
 import tiktoken
@@ -28,7 +30,7 @@ logger = logging.getLogger(__name__)
 class SampleConfig:
     """Configurações para amostragem de texto do modelo."""
     init_from: str = choice("resume", "gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl", default="resume")
-    out_dir: str = 'out'
+    out_dir: str = str(OUTPUT_DIR / "c4" / "seq_s1337")
     start: str = '\n'  # Pode ser texto direto ou "FILE:prompt.txt"
     num_samples: int = 10
     max_new_tokens: int = 500
