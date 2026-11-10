@@ -742,11 +742,18 @@ def run(cfg: Config, rt: Runtime) -> None:
     rt.master = rt.rank == 0
     rt.device_type = 'cuda' if 'cuda' in str(rt.device) else 'cpu'
 
-    # Logger config. e silenciado para processos paralelos que não sejam master
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    handlers = [logging.StreamHandler()]
+
+    if rt.master:
+        handlers.append(logging.FileHandler(os.path.join(cfg.out_dir, 'train.log'), mode='a', encoding='utf-8'))
+
     logging.basicConfig(
         level=logging.INFO if rt.master else logging.WARNING,
         format='%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%H:%M:%S'
+        datefmt='%H:%M:%S',
+        handlers=handlers,
+        force=True
     )
 
     if cfg.dtype is None:
