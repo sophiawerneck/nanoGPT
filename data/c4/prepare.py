@@ -51,8 +51,12 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from simple_parsing import ArgumentParser
-from common import INPUT_DIR, TOKEN_DTYPE, write_json, read_json
 
+import os
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+
+from common import INPUT_DIR, TOKEN_DTYPE, write_json, read_json
 
 @dataclass
 class C4Config:
