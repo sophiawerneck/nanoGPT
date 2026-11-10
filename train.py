@@ -80,7 +80,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from simple_parsing import ArgumentParser
 from model import GPTConfig, GPT
 from common import (
-    BASE_DIR, OUTPUT_DIR, count_windows, load_windows, default_dtype, autocast_ctx, sync,
+    BASE_DIR, INPUT_DIR, OUTPUT_DIR, count_windows, load_windows, default_dtype, autocast_ctx, sync,
     strip_compile_prefix, count_params, environment_info, write_json, read_json,
     file_sha256,
 )
@@ -631,7 +631,7 @@ def main() -> None:
     cfg: Config = args.cfg 
 
     if cfg.data_dir is None:
-        cfg.data_dir = os.path.join(BASE_DIR, 'data', cfg.dataset)
+        cfg.data_dir = os.path.join(INPUT_DIR, cfg.dataset)
     if cfg.out_dir is None:
         cfg.out_dir = os.path.join(OUTPUT_DIR, cfg.dataset, f'{cfg.block_type}_s{cfg.seed}')
 
