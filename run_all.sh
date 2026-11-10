@@ -1,27 +1,19 @@
-
 #!/usr/bin/env bash
 # Script principal de execução: dados -> treino de todas as variantes e sementes.
 #
 # Fluxo de funcionamento:
 # - Preparação de dados: identifica o dataset configurado e aciona o script
-#   de preparação correspondente (ex: prepare_c4.py).
+#   de preparação correspondente.
 # - Orquestração de treino: itera sobre todas as sementes (SEEDS) e variantes
 #   de bloco (VARIANTS), executando o pipeline para cada combinação.
-# - Verifica os artefatos no diretório de saída (out/): pula execuções já
-#   finalizadas (com summary.json) e retoma as interrompidas (com ckpt.pt).
+# - Verifica os artefatos no diretório de saída: pula execuções já finalizadas
+#   (com summary.json) e retoma as interrompidas (com ckpt.pt).
 # - Transita automaticamente entre uma GPU (python) e múltiplas GPUs via DDP
 #   (torchrun), com base na variável NPROC.
 # - Após o treinamento, executa o benchmark de latência de inferência
 #   (bench.py).
-# - Agregação (Summarize): processa os arquivos gerados para criar as tabelas
+# - Agregação: processa os arquivos gerados para criar as tabelas
 #   comparativas e os gráficos finais (summarize.py).
-#
-# Variáveis de ambiente (opcionais):
-#   DATASET=c4               c4 (experimento) ou shakespeare_char (teste)
-#   SEEDS="1337 1338 1339"   sementes (padrão: 3)
-#   VARIANTS="seq inv par"   variantes
-#   NPROC=1                  GPUs por execução (usa torchrun se > 1)
-#   TRAIN_ARGS=""            argumentos extras para train.py (ex.: --peak_tflops 989)
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -33,11 +25,15 @@ NPROC="${NPROC:-1}"
 TRAIN_ARGS="${TRAIN_ARGS:-}"
 
 OUTPUT_DIR="$(python -c 'from common import OUTPUT_DIR; print(OUTPUT_DIR)')"
+INPUT_DIR="$(python -c 'from common import INPUT_DIR; print(INPUT_DIR)')"
+
 DATASET_OUT="${OUTPUT_DIR}/${DATASET}"
+C4_INPUT="${INPUT_DIR}/c4"
 
 mkdir -p "$DATASET_OUT"
 exec > >(tee -a "${DATASET_OUT}/run_all.log") 2>&1
 
+echo "Diretório de entrada: ${INPUT_DIR}"
 echo "Diretório de saída: ${DATASET_OUT}"
 echo "Dataset: ${DATASET}"
 echo "Sementes: ${SEEDS}"
@@ -52,9 +48,9 @@ fi
 prepare_data() {
   case "$DATASET" in
     c4)
-      if [[ ! -f data/c4/train.bin ||
-            ( ! -f data/c4/validation.bin &&
-              ! -f data/c4/val.bin ) ]]; then
+      if [[ ! -f "$C4_INPUT/train.bin" ||
+            ( ! -f "$C4_INPUT/validation.bin" &&
+              ! -f "$C4_INPUT/val.bin" ) ]]; then
         echo "Preparando o C4..."
         python data/c4/prepare.py
       else
@@ -63,15 +59,8 @@ prepare_data() {
       ;;
 
     shakespeare_char)
-      if [[ ! -f data/shakespeare_char/train.bin ||
-            ! -f data/shakespeare_char/meta.pkl ||
-            ( ! -f data/shakespeare_char/val.bin &&
-              ! -f data/shakespeare_char/validation.bin ) ]]; then
-        echo "Preparando Shakespeare..."
-        python data/shakespeare_char/prepare.py
-      else
-        echo "Dados de Shakespeare já presentes. Pulando preparação."
-      fi
+      echo "A preparação de shakespeare_char ainda precisa ser adaptada para INPUT_DIR." >&2
+      exit 2
       ;;
 
     *)
@@ -102,11 +91,13 @@ train_and_evaluate() {
       --out_dir "$out"
     )
 
+    args+=("${EXTRA_TRAIN_ARGS[@]}")
+
     if [[ "$NPROC" -gt 1 ]]; then
       torchrun --standalone --nproc_per_node="$NPROC" \
-        train.py "${args[@]}" $TRAIN_ARGS
+        train.py "${args[@]}"
     else
-      python train.py "${args[@]}" $TRAIN_ARGS
+      python train.py "${args[@]}"
     fi
   fi
 
@@ -136,7 +127,5 @@ main() {
   echo "Pipeline concluído."
   echo "Resultados salvos em: $DATASET_OUT"
 }
-
-main "$@"
 
 main "$@"
