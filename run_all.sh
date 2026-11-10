@@ -142,7 +142,12 @@ train_and_evaluate() {
   fi
 
   python bench.py --out_dir "$out"
+  
+  # Gera 5 amostras de texto e salva num arquivo txt
+  echo ">> Gerando amostras de texto para $variant..."
+  python sample.py --out_dir "$out" --num_samples 5 > "$out/samples_text.txt"
 }
+
 
 # Repete uma execução com a mesma semente e compara a loss final do holdout
 # com a da execução original: a diferença estima o ruído de não determinismo.
