@@ -28,7 +28,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 DATASET="${DATASET:-c4}"
 SEEDS="${SEEDS:-1337 1338 1339}"
-VARIANTS="${VARIANTS:-seq inv par}"
+VARIANTS="${VARIANTS:-seq inv par par_shared}"
 NPROC="${NPROC:-1}"
 TRAIN_ARGS="${TRAIN_ARGS:-}"
 
