@@ -6,6 +6,7 @@ import argparse
 from contextlib import nullcontext
 from pathlib import Path
 from common import OUTPUT_DIR
+import logging
 
 import torch
 from model import GPTConfig, GPT
@@ -13,7 +14,7 @@ from model import GPTConfig, GPT
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Benchmark inference latency")
-    parser.add_argument('--out_dir', type=str, default=str(OUTPUT_DIR / 'c4' / 'seq_s1337'))
+    parser.add_argument('--out_dir', type=str, required=True)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument(
         '--dtype', type=str, default=None,
@@ -36,6 +37,23 @@ def parse_args():
 def main():
     args = parse_args()
     out_dir = args.out_dir
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(
+                os.path.join(out_dir, 'bench.log'),
+                mode='a',
+                encoding='utf-8'
+            )
+        ],
+        force=True
+    )
+    logger = logging.getLogger(__name__)
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"Checkpoint não encontrado: {ckpt_path}")
@@ -111,7 +129,7 @@ def main():
     model.to(device)
 
     if args.compile:
-        print("Compiling model...")
+        logger.info("Compiling model...") 
         model = torch.compile(model)
 
     prompt_length = 10
@@ -130,7 +148,7 @@ def main():
         if device.type == 'cuda':
             torch.cuda.synchronize(device)
 
-    print("Warming up...")
+    logger.info("Warming up...")
     with torch.no_grad():
         with ctx:
             _ = model.generate(
@@ -141,7 +159,7 @@ def main():
             )
     synchronize()
 
-    print("Benchmarking...")
+    logger.info("Benchmarking...")
     generate_times = []
     generated_token_counts = []
 
@@ -166,14 +184,11 @@ def main():
                 elapsed = time.perf_counter() - start_time
                 generated_tokens = int(y.shape[1] - x.shape[1])
                 if generated_tokens <= 0:
-                    raise RuntimeError(
-                        "model.generate() não retornou nenhum token além do prompt."
-                    )
+                    raise RuntimeError("model.generate() não retornou nenhum token além do prompt.")
 
                 generate_times.append(elapsed)
                 generated_token_counts.append(generated_tokens)
-                print(f"{sample_idx + 1}/{args.num_samples} time: {elapsed:.3f}s")
-
+                logger.info(f"{sample_idx + 1}/{args.num_samples} time: {elapsed:.3f}s")
     mean_time = sum(generate_times) / len(generate_times)
     std_time = (
         sum((elapsed - mean_time) ** 2 for elapsed in generate_times)
@@ -184,10 +199,9 @@ def main():
     total_generation_time = sum(generate_times)
     tokens_per_sec = total_generated_tokens / total_generation_time
 
-    print(f"Mean latency time: {mean_time:.3f} s ({mean_time * 1000:.2f} ms)")
-    print(f"Standard deviation: {std_time:.3f} s ({std_time * 1000:.2f} ms)")
-    print(f"Throughput: {tokens_per_sec:.2f} tokens/s")
-
+    logger.info(f"Mean latency time: {mean_time:.3f} s ({mean_time * 1000:.2f} ms)")
+    logger.info(f"Standard deviation: {std_time:.3f} s ({std_time * 1000:.2f} ms)")
+    logger.info(f"Throughput: {tokens_per_sec:.2f} tokens/s")
     bench_metrics = {
         'inference_latency_mean_s': mean_time,
         'inference_latency_std_s': std_time,
@@ -212,7 +226,7 @@ def main():
     with open(bench_out_path, 'w', encoding='utf-8') as file:
         json.dump(bench_metrics, file, indent=4, ensure_ascii=False)
 
-    print(f"Benchmark salvo em: {bench_out_path}")
+    logger.info(f"Benchmark salvo em: {bench_out_path}")
 
 
 if __name__ == '__main__':
