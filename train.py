@@ -80,7 +80,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from simple_parsing import ArgumentParser
 from model import GPTConfig, GPT
 from common import (
-    BASE_DIR, count_windows, load_windows, default_dtype, autocast_ctx, sync,
+    BASE_DIR, OUTPUT_DIR, count_windows, load_windows, default_dtype, autocast_ctx, sync,
     strip_compile_prefix, count_params, environment_info, write_json, read_json,
     file_sha256,
 )
