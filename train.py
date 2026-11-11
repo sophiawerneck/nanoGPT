@@ -215,7 +215,8 @@ class Config:
     compile: bool = True
     allow_multi_epoch: bool = False
     timing_warmup_iters: int = 10
-    peak_tflops: float = 65.0
+    peak_tflops: float = 848.0 # MIG 3g.71gb da H200 
+
 
     # ignorados pelo CLI devido ao init=False
     grad_accum_per_rank: int = field(default=0, init=False)

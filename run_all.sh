@@ -97,9 +97,14 @@ prepare_data() {
       esac
       ;;
 
-    shakespeare_char)
-      echo "A preparação de shakespeare_char ainda precisa ser adaptada para INPUT_DIR." >&2
-      exit 2
+      shakespeare_char)
+      local shp_train="${INPUT_DIR}/shakespeare_char/train.bin"
+      if [[ -f "$shp_train" ]]; then
+        echo "Dados do shakespeare_char encontrados. Pulando preparação."
+      else
+        echo "Preparando o shakespeare_char..."
+        python data/shakespeare_char/prepare.py
+      fi
       ;;
 
     *)
