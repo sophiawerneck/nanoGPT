@@ -71,7 +71,7 @@ def get_metrics_from_seed_logs(out_dir, seeds, type_model):
     return runs
 
 
-def _aggregate_metric(runs, x_key, y_key):
+def _aggregate_metric(runs, x_key, y_key, smooth=False):
     values_by_run = [
         dict(zip(run[x_key], run[y_key]))
         for run in runs
@@ -84,6 +84,8 @@ def _aggregate_metric(runs, x_key, y_key):
         raise ValueError(f"Não há iterações em comum para agregar {y_key}.")
 
     values = np.array([[run[step] for step in common_steps] for run in values_by_run])
+    if smooth:
+        values = np.apply_along_axis(_moving_average, 1, values)
     return np.array(common_steps), values.mean(axis=0), values.std(axis=0)
 
 
@@ -92,16 +94,11 @@ def _moving_average(values, window=100):
     if series.empty:
         return series.to_numpy()
     return series.rolling(
-        window=min(window, len(series)),
-        min_periods=1, center=True
+        window=window, min_periods=1
     ).mean().to_numpy()
 
 
-def _plot_mean_std(ax, steps, mean, std, label, color=None, smooth=False):
-    if smooth:
-        mean = _moving_average(mean)
-        std = _moving_average(std)
-
+def _plot_mean_std(ax, steps, mean, std, label, color=None):
     line, = ax.plot(steps, mean, label=f"{label} (média)", color=color)
     ax.fill_between(
         steps,
@@ -114,16 +111,46 @@ def _plot_mean_std(ax, steps, mean, std, label, color=None, smooth=False):
     return line
 
 
-def plot_loss(out_dir, seeds, type_model, smooth=False):
+def _set_y_limits_from_iteration(ax, steps, mean_std_series, start_iter):
+    if start_iter is None:
+        return
+
+    visible = np.asarray(steps) >= start_iter
+    if not visible.any():
+        return
+
+    bounds = np.concatenate([
+        values
+        for mean, std in mean_std_series
+        for values in (mean[visible] - std[visible], mean[visible] + std[visible])
+    ])
+    bounds = bounds[np.isfinite(bounds)]
+    if not bounds.size:
+        return
+
+    low, high = bounds.min(), bounds.max()
+    padding = max((high - low) * 0.05, abs(low) * 0.05, 0.05)
+    ax.set_ylim(low - padding, high + padding)
+
+
+def plot_loss(out_dir, seeds, type_model, smooth=False, start_iter=500):
     if type_model not in MODEL_TITLES:
         return
     runs = get_metrics_from_seed_logs(out_dir, seeds, type_model)
-    t_steps, t_mean, t_std = _aggregate_metric(runs, "iteration", "train_loss")
-    v_steps, v_mean, v_std = _aggregate_metric(runs, "iteration", "val_loss")
+    t_steps, t_mean, t_std = _aggregate_metric(
+        runs, "iteration", "train_loss", smooth=smooth
+    )
+    v_steps, v_mean, v_std = _aggregate_metric(
+        runs, "iteration", "val_loss", smooth=smooth
+    )
 
     plt.figure(figsize=(8, 5))
-    _plot_mean_std(plt.gca(), t_steps, t_mean, t_std, "treino", smooth=smooth)
-    _plot_mean_std(plt.gca(), v_steps, v_mean, v_std, "validação", smooth=smooth)
+    ax = plt.gca()
+    _plot_mean_std(ax, t_steps, t_mean, t_std, "treino")
+    _plot_mean_std(ax, v_steps, v_mean, v_std, "validação")
+    _set_y_limits_from_iteration(
+        ax, t_steps, ((t_mean, t_std), (v_mean, v_std)), start_iter
+    )
 
     plt.xlabel('iteração'); plt.ylabel('loss'); plt.legend()
     plt.title(MODEL_TITLES[type_model])
@@ -133,11 +160,12 @@ def plot_loss(out_dir, seeds, type_model, smooth=False):
 
 # Geração dos plots de loss, perplexity, gap e tempo
 def plot_loss_perplexity_gap_time(
-    out_dir, seeds, type_model, path_directory_save, name_file_save, smooth=False
+    out_dir, seeds, type_model, path_directory_save, name_file_save,
+    smooth=False, start_iter=500
 ):
     runs = get_metrics_from_seed_logs(out_dir, seeds, type_model)
     metrics = {
-        key: _aggregate_metric(runs, "iteration", key)
+        key: _aggregate_metric(runs, "iteration", key, smooth=smooth)
         for key in ("train_loss", "val_loss", "perplexity", "gap")
     }
 
@@ -154,7 +182,7 @@ def plot_loss_perplexity_gap_time(
                 filtered["time_per_iteration_ms"].append(elapsed)
         time_runs.append(filtered)
     time_steps, time_mean, time_std = _aggregate_metric(
-        time_runs, "time_iteration", "time_per_iteration_ms"
+        time_runs, "time_iteration", "time_per_iteration_ms", smooth=smooth
     )
 
     steps, train_mean, train_std = metrics["train_loss"]
@@ -166,21 +194,31 @@ def plot_loss_perplexity_gap_time(
     fig, ax = plt.subplots(2, 2, figsize=(12, 8))
 
     # 1) loss de treino e validação, com o melhor ponto marcado
-    _plot_mean_std(ax[0, 0], steps, train_mean, train_std, 'treino', smooth=smooth)
-    _plot_mean_std(ax[0, 0], steps, val_mean, val_std, 'validação', smooth=smooth)
+    _plot_mean_std(ax[0, 0], steps, train_mean, train_std, 'treino')
+    _plot_mean_std(ax[0, 0], steps, val_mean, val_std, 'validação')
+    _set_y_limits_from_iteration(
+        ax[0, 0], steps, ((train_mean, train_std), (val_mean, val_std)), start_iter
+    )
     ax[0, 0].axvline(steps[best], color='gray', linestyle='--', label=f'melhor val (iter {steps[best]})')
     ax[0, 0].set_title('Loss'); ax[0, 0].set_xlabel('iteração'); ax[0, 0].set_ylabel('loss'); ax[0, 0].legend()
 
     # 2) perplexity de validação
-    _plot_mean_std(ax[0, 1], steps, ppl_mean, ppl_std, 'perplexity', color='tab:orange', smooth=smooth)
+    _plot_mean_std(ax[0, 1], steps, ppl_mean, ppl_std, 'perplexity', color='tab:orange')
+    _set_y_limits_from_iteration(
+        ax[0, 1], steps, ((ppl_mean, ppl_std),), start_iter
+    )
     ax[0, 1].set_title('Perplexity de validação (exp da loss)'); ax[0, 1].set_xlabel('iteração'); ax[0, 1].set_ylabel('perplexity')
 
     # 3) diferença validação - treino (overfitting)
-    _plot_mean_std(ax[1, 0], steps, gap_mean, gap_std, 'gap', color='tab:red', smooth=smooth)
+    _plot_mean_std(ax[1, 0], steps, gap_mean, gap_std, 'gap', color='tab:red')
+    _set_y_limits_from_iteration(ax[1, 0], steps, ((gap_mean, gap_std),), start_iter)
     ax[1, 0].set_title('Gap de generalização (val - treino)'); ax[1, 0].set_xlabel('iteração'); ax[1, 0].set_ylabel('diferença de loss')
 
     # 4) tempo por iteração (ignorando as primeiras, que incluem aquecimento)
-    _plot_mean_std(ax[1, 1], time_steps, time_mean, time_std, 'tempo', color='tab:green', smooth=smooth)
+    _plot_mean_std(ax[1, 1], time_steps, time_mean, time_std, 'tempo', color='tab:green')
+    _set_y_limits_from_iteration(
+        ax[1, 1], time_steps, ((time_mean, time_std),), start_iter
+    )
     ax[1, 1].set_title('Tempo por iteração'); ax[1, 1].set_xlabel('iteração'); ax[1, 1].set_ylabel('ms')
 
     fig.suptitle(MODEL_TITLES[type_model])
