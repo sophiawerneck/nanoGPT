@@ -5,18 +5,26 @@ Will save train.bin, val.bin containing the ids, and meta.pkl containing the
 encoder and decoder and some other related info.
 """
 import os
+import sys
 import pickle
 import requests
 import numpy as np
 
-# download the tiny shakespeare dataset
-input_file_path = os.path.join(os.path.dirname(__file__), 'input.txt')
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from common import INPUT_DIR
+
+# Define o caminho correto dentro de INPUT_DIR e cria a pasta se não existir
+out_dir = os.path.join(INPUT_DIR, 'shakespeare_char')
+os.makedirs(out_dir, exist_ok=True)
+
+# download the tiny shakespeare dataset diretamente para o out_dir
+input_file_path = os.path.join(out_dir, 'input.txt')
 if not os.path.exists(input_file_path):
     data_url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
-    with open(input_file_path, 'w') as f:
+    with open(input_file_path, 'w', encoding='utf-8') as f:
         f.write(requests.get(data_url).text)
 
-with open(input_file_path, 'r') as f:
+with open(input_file_path, 'r', encoding='utf-8') as f:
     data = f.read()
 print(f"length of dataset in characters: {len(data):,}")
 
@@ -48,8 +56,8 @@ print(f"val has {len(val_ids):,} tokens")
 # export to bin files
 train_ids = np.array(train_ids, dtype=np.uint16)
 val_ids = np.array(val_ids, dtype=np.uint16)
-train_ids.tofile(os.path.join(os.path.dirname(__file__), 'train.bin'))
-val_ids.tofile(os.path.join(os.path.dirname(__file__), 'val.bin'))
+train_ids.tofile(os.path.join(out_dir, 'train.bin'))
+val_ids.tofile(os.path.join(out_dir, 'val.bin'))
 
 # save the meta information as well, to help us encode/decode later
 meta = {
@@ -57,7 +65,7 @@ meta = {
     'itos': itos,
     'stoi': stoi,
 }
-with open(os.path.join(os.path.dirname(__file__), 'meta.pkl'), 'wb') as f:
+with open(os.path.join(out_dir, 'meta.pkl'), 'wb') as f:
     pickle.dump(meta, f)
 
 # length of dataset in characters:  1115394
