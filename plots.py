@@ -87,7 +87,21 @@ def _aggregate_metric(runs, x_key, y_key):
     return np.array(common_steps), values.mean(axis=0), values.std(axis=0)
 
 
-def _plot_mean_std(ax, steps, mean, std, label, color=None):
+def _moving_average(values, window=100):
+    series = pd.Series(values)
+    if series.empty:
+        return series.to_numpy()
+    return series.rolling(
+        window=min(window, len(series)),
+        min_periods=1, center=True
+    ).mean().to_numpy()
+
+
+def _plot_mean_std(ax, steps, mean, std, label, color=None, smooth=False):
+    if smooth:
+        mean = _moving_average(mean)
+        std = _moving_average(std)
+
     line, = ax.plot(steps, mean, label=f"{label} (média)", color=color)
     ax.fill_between(
         steps,
@@ -100,7 +114,7 @@ def _plot_mean_std(ax, steps, mean, std, label, color=None):
     return line
 
 
-def plot_loss(out_dir, seeds, type_model):
+def plot_loss(out_dir, seeds, type_model, smooth=False):
     if type_model not in MODEL_TITLES:
         return
     runs = get_metrics_from_seed_logs(out_dir, seeds, type_model)
@@ -108,8 +122,8 @@ def plot_loss(out_dir, seeds, type_model):
     v_steps, v_mean, v_std = _aggregate_metric(runs, "iteration", "val_loss")
 
     plt.figure(figsize=(8, 5))
-    _plot_mean_std(plt.gca(), t_steps, t_mean, t_std, "treino")
-    _plot_mean_std(plt.gca(), v_steps, v_mean, v_std, "validação")
+    _plot_mean_std(plt.gca(), t_steps, t_mean, t_std, "treino", smooth=smooth)
+    _plot_mean_std(plt.gca(), v_steps, v_mean, v_std, "validação", smooth=smooth)
 
     plt.xlabel('iteração'); plt.ylabel('loss'); plt.legend()
     plt.title(MODEL_TITLES[type_model])
@@ -119,7 +133,7 @@ def plot_loss(out_dir, seeds, type_model):
 
 # Geração dos plots de loss, perplexity, gap e tempo
 def plot_loss_perplexity_gap_time(
-    out_dir, seeds, type_model, path_directory_save, name_file_save
+    out_dir, seeds, type_model, path_directory_save, name_file_save, smooth=False
 ):
     runs = get_metrics_from_seed_logs(out_dir, seeds, type_model)
     metrics = {
@@ -152,21 +166,21 @@ def plot_loss_perplexity_gap_time(
     fig, ax = plt.subplots(2, 2, figsize=(12, 8))
 
     # 1) loss de treino e validação, com o melhor ponto marcado
-    _plot_mean_std(ax[0, 0], steps, train_mean, train_std, 'treino')
-    _plot_mean_std(ax[0, 0], steps, val_mean, val_std, 'validação')
+    _plot_mean_std(ax[0, 0], steps, train_mean, train_std, 'treino', smooth=smooth)
+    _plot_mean_std(ax[0, 0], steps, val_mean, val_std, 'validação', smooth=smooth)
     ax[0, 0].axvline(steps[best], color='gray', linestyle='--', label=f'melhor val (iter {steps[best]})')
     ax[0, 0].set_title('Loss'); ax[0, 0].set_xlabel('iteração'); ax[0, 0].set_ylabel('loss'); ax[0, 0].legend()
 
     # 2) perplexity de validação
-    _plot_mean_std(ax[0, 1], steps, ppl_mean, ppl_std, 'perplexity', color='tab:orange')
+    _plot_mean_std(ax[0, 1], steps, ppl_mean, ppl_std, 'perplexity', color='tab:orange', smooth=smooth)
     ax[0, 1].set_title('Perplexity de validação (exp da loss)'); ax[0, 1].set_xlabel('iteração'); ax[0, 1].set_ylabel('perplexity')
 
     # 3) diferença validação - treino (overfitting)
-    _plot_mean_std(ax[1, 0], steps, gap_mean, gap_std, 'gap', color='tab:red')
+    _plot_mean_std(ax[1, 0], steps, gap_mean, gap_std, 'gap', color='tab:red', smooth=smooth)
     ax[1, 0].set_title('Gap de generalização (val - treino)'); ax[1, 0].set_xlabel('iteração'); ax[1, 0].set_ylabel('diferença de loss')
 
     # 4) tempo por iteração (ignorando as primeiras, que incluem aquecimento)
-    _plot_mean_std(ax[1, 1], time_steps, time_mean, time_std, 'tempo', color='tab:green')
+    _plot_mean_std(ax[1, 1], time_steps, time_mean, time_std, 'tempo', color='tab:green', smooth=smooth)
     ax[1, 1].set_title('Tempo por iteração'); ax[1, 1].set_xlabel('iteração'); ax[1, 1].set_ylabel('ms')
 
     fig.suptitle(MODEL_TITLES[type_model])
