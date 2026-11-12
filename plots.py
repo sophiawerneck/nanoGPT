@@ -50,7 +50,7 @@ def get_metrics_from_log(log_file):
                 continue
 
             match = time_pattern.search(line)
-            if match:
+            if match and "(aquecimento)" not in line:
                 iteration, elapsed_ms = match.groups()
                 metrics["time_iteration"].append(int(iteration))
                 metrics["time_per_iteration_ms"].append(float(elapsed_ms))
