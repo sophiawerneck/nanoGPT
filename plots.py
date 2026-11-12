@@ -26,6 +26,11 @@ def get_metrics_from_log(log_file):
         "time_per_iteration_ms": []
     }
 
+    numeric = r'([+-]?(?:\d+(?:\.\d*)?|\.\d+))'
+    holdout_loss_pattern = re.compile(
+        r'step\s+(\d+):\s*train loss\s+' + numeric
+        + r'.*?\bval holdout loss\s+' + numeric
+    )
     loss_pattern = re.compile(
         r'step\s+(\d+):\s*train loss\s+([+-]?(?:\d+(?:\.\d*)?|\.\d+))'
         r'\s*(?:\||,)\s*val (?:monitor )?loss\s+'
@@ -38,14 +43,14 @@ def get_metrics_from_log(log_file):
 
     with open(log_file, encoding="utf-8") as log:
         for line in log:
-            match = loss_pattern.search(line)
+            match = holdout_loss_pattern.search(line) or loss_pattern.search(line)
             if match:
                 iteration, train_loss, val_loss = match.groups()
                 train_loss, val_loss = float(train_loss), float(val_loss)
                 metrics["iteration"].append(int(iteration))
                 metrics["train_loss"].append(train_loss)
                 metrics["val_loss"].append(val_loss)
-                metrics["perplexity"].append(math.exp(val_loss))
+                metrics["perplexity"].append(float(np.exp(val_loss)))
                 metrics["gap"].append(val_loss - train_loss)
                 continue
 
@@ -71,7 +76,7 @@ def get_metrics_from_seed_logs(out_dir, seeds, type_model):
     return runs
 
 
-def _aggregate_metric(runs, x_key, y_key, smooth=False):
+def _aggregate_metric(runs, x_key, y_key, smooth=False, ddof=0):
     values_by_run = [
         dict(zip(run[x_key], run[y_key]))
         for run in runs
@@ -86,7 +91,16 @@ def _aggregate_metric(runs, x_key, y_key, smooth=False):
     values = np.array([[run[step] for step in common_steps] for run in values_by_run])
     if smooth:
         values = np.apply_along_axis(_moving_average, 1, values)
-    return np.array(common_steps), values.mean(axis=0), values.std(axis=0)
+    std = (
+        values.std(axis=0, ddof=ddof)
+        if values.shape[0] > ddof
+        else np.full(values.shape[1], np.nan)
+    )
+    return (
+        np.array(common_steps),
+        values.mean(axis=0),
+        std,
+    )
 
 
 def _moving_average(values, window=100):
@@ -161,7 +175,7 @@ def plot_loss(out_dir, seeds, type_model, smooth=False, start_iter=500):
 # Geração dos plots de loss, perplexity, gap e tempo
 def plot_loss_perplexity_gap_time(
     out_dir, seeds, type_model, path_directory_save, name_file_save,
-    smooth=False, start_iter=500
+    smooth=False, start_iter=1000
 ):
     seeds = list(seeds)
     if not seeds:
@@ -189,9 +203,24 @@ def plot_loss_perplexity_gap_time(
             get_metrics_from_log(os.path.join(run_dir, "log.txt"))
             for run_dir in run_dirs
         ]
+        perplexity_runs = []
+        for run in runs:
+            run_with_perplexity = dict(run)
+            run_with_perplexity["perplexity"] = np.exp(
+                np.asarray(run["val_loss"], dtype=float)
+            ).tolist()
+            perplexity_runs.append(run_with_perplexity)
+
         metrics = {
-            key: _aggregate_metric(runs, "iteration", key, smooth=smooth)
-            for key in ("train_loss", "perplexity", "gap")
+            "val_loss": _aggregate_metric(
+                runs, "iteration", "val_loss", ddof=1
+            ),
+            "perplexity": _aggregate_metric(
+                perplexity_runs, "iteration", "perplexity", ddof=1
+            ),
+            "gap": _aggregate_metric(
+                runs, "iteration", "gap", ddof=1
+            ),
         }
 
         time_runs = []
@@ -210,7 +239,8 @@ def plot_loss_perplexity_gap_time(
                     filtered["time_per_iteration_ms"].append(elapsed)
             time_runs.append(filtered)
         metrics["time"] = _aggregate_metric(
-            time_runs, "time_iteration", "time_per_iteration_ms", smooth=smooth
+            time_runs, "time_iteration", "time_per_iteration_ms",
+            smooth=smooth, ddof=1
         )
         aggregated[model_type] = metrics
 
@@ -220,12 +250,11 @@ def plot_loss_perplexity_gap_time(
     fig, ax = plt.subplots(2, 2, figsize=(12, 8))
     colors = plt.get_cmap("tab10").colors
     metric_axes = (
-        (ax[0, 0], "train_loss", "Loss de Treinamento", "loss"),
-        (ax[0, 1], "perplexity", "Perplexidade de Validação", "perplexidade"),
+        (ax[0, 0], "val_loss", "Loss de Validação", "Loss de Validação"),
+        (ax[0, 1], "perplexity", "Perplexidade de Validação", "Perplexidade"),
         (ax[1, 0], "gap", "Gap de Generalização (Val - Treino)", "diferença de loss"),
         (ax[1, 1], "time", "Tempo por Iteração", "ms"),
     )
-    plotted_series = {key: [] for _, key, _, _ in metric_axes}
 
     def plot_model_series(axis, steps, mean, std, label, color):
         line, = axis.plot(steps, mean, label=label, color=color)
@@ -239,7 +268,6 @@ def plot_loss_perplexity_gap_time(
         for axis, metric_key, _, _ in metric_axes:
             steps, mean, std = metrics[metric_key]
             plot_model_series(axis, steps, mean, std, label, color)
-            plotted_series[metric_key].append((steps, mean, std))
 
     for axis, metric_key, title, ylabel in metric_axes:
         axis.set_title(title)
@@ -247,38 +275,64 @@ def plot_loss_perplexity_gap_time(
         axis.set_ylabel(ylabel)
         axis.grid(True, linestyle="--", alpha=0.6)
         axis.legend()
-        if start_iter is not None:
-            bounds = []
-            for steps, mean, std in plotted_series[metric_key]:
-                visible = steps >= start_iter
-                if visible.any():
-                    bounds.extend((
-                        mean[visible] - std[visible],
-                        mean[visible] + std[visible],
-                    ))
-            if bounds:
-                visible_bounds = np.concatenate(bounds)
-                visible_bounds = visible_bounds[np.isfinite(visible_bounds)]
-                if visible_bounds.size:
-                    low, high = visible_bounds.min(), visible_bounds.max()
-                    padding = max((high - low) * 0.05, abs(low) * 0.05, 0.05)
-                    axis.set_ylim(low - padding, high + padding)
+
+    def apply_zoom(axis, metric_key):
+        bounds = []
+        max_step = None
+        for metrics in aggregated.values():
+            steps, mean, std = metrics[metric_key]
+            max_step = steps[-1] if max_step is None else max(max_step, steps[-1])
+            visible = steps >= start_iter
+            if visible.any():
+                visible_mean = mean[visible]
+                visible_std = std[visible]
+                lower = np.where(
+                    np.isfinite(visible_std), visible_mean - visible_std, visible_mean
+                )
+                upper = np.where(
+                    np.isfinite(visible_std), visible_mean + visible_std, visible_mean
+                )
+                bounds.extend((
+                    lower,
+                    upper,
+                ))
+        if max_step is None or max_step <= start_iter:
+            return
+
+        axis.set_xlim(left=start_iter, right=max_step)
+        if not bounds:
+            return
+        values = np.concatenate(bounds)
+        values = values[np.isfinite(values)]
+        if not values.size:
+            return
+        low, high = values.min(), values.max()
+        padding = (high - low) * 0.05
+        if padding == 0:
+            padding = max(abs(low) * 0.05, 0.05)
+        axis.set_ylim(low - padding, high + padding)
+
+    if start_iter is not None:
+        apply_zoom(ax[0, 0], "val_loss")
+        apply_zoom(ax[0, 1], "perplexity")
 
     fig.suptitle("Comparação dos Modelos")
     plt.tight_layout()
 
     os.makedirs(path_directory_save, exist_ok=True)
-    fig.savefig(name_file_save, dpi=150)
+    fig.savefig(name_file_save, dpi=300, bbox_inches="tight")
     plt.show()
 
     for model_type, metrics in aggregated.items():
-        _, train_mean, _ = metrics["train_loss"]
-        _, ppl_mean, _ = metrics["perplexity"]
+        val_steps, val_mean, _ = metrics["val_loss"]
+        ppl_steps, ppl_mean, _ = metrics["perplexity"]
         _, time_mean, _ = metrics["time"]
+        final_step = min(val_steps[-1], ppl_steps[-1])
         print(
-            f"{model_names[model_type]} — loss treino final: {train_mean[-1]:.4f}, "
-            f"perplexidade final: {ppl_mean[-1]:.2f}, "
-            f"tempo mediano: {np.median(time_mean):.1f} ms"
+            f"{model_names[model_type]} — passo final {final_step}: "
+            f"loss de validação {val_mean[-1]:.4f}, "
+            f"perplexidade {ppl_mean[-1]:.2f}; "
+            f"tempo mediano {np.median(time_mean):.1f} ms"
         )
 
 
