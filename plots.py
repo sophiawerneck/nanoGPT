@@ -296,7 +296,7 @@ def generate_all_metrics(benchmark_files, log_files):
 
 
 def fmt(mean, std):
-    return f"{mean:.2f} ± {std:.2f}"
+    return f"{mean:.4f} ± {std:.4f}"
 
 
 # Gera a tabela final para todos os modelos, com nome do modelo,
