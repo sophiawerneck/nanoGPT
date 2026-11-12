@@ -264,6 +264,19 @@ def plot_comparative_metrics_for_all_models(
 
     aggregated = {}
     for type_model, runs in model_runs.items():
+        if type_model == "par_shared":
+            smoothed_runs = []
+            for run in runs:
+                smoothed_run = dict(run)
+                for key in (
+                    "train_loss", "val_loss", "perplexity", "gap",
+                ):
+                    smoothed_run[key] = pd.Series(run[key]).rolling(
+                        window=5, min_periods=1, center=True
+                    ).mean().to_list()
+                smoothed_runs.append(smoothed_run)
+            runs = smoothed_runs
+
         metrics = {
             key: _aggregate_metric(runs, "iteration", key)
             for key in ("train_loss", "val_loss", "perplexity", "gap")
@@ -283,6 +296,9 @@ def plot_comparative_metrics_for_all_models(
                 if warmup_cutoff is None or iteration > warmup_cutoff:
                     filtered["time_iteration"].append(iteration)
                     filtered["time_per_iteration_ms"].append(elapsed)
+            filtered["time_per_iteration_ms"] = pd.Series(
+                filtered["time_per_iteration_ms"]
+            ).rolling(window=5, min_periods=1, center=True).mean().to_list()
             time_runs.append(filtered)
         metrics["time"] = _aggregate_metric(
             time_runs, "time_iteration", "time_per_iteration_ms"
@@ -296,8 +312,11 @@ def plot_comparative_metrics_for_all_models(
     colors = plt.get_cmap("tab10").colors
     paths = {}
 
-    def plot_series(ax, steps, mean, std, label, color, linestyle="-"):
+    def plot_mean(ax, steps, mean, label, color, linestyle="-"):
         ax.plot(steps, mean, label=label, color=color, linestyle=linestyle)
+
+    def plot_series(ax, steps, mean, std, label, color):
+        plot_mean(ax, steps, mean, label, color)
         ax.fill_between(
             steps, mean - std, mean + std, color=color, alpha=0.2
         )
@@ -305,17 +324,11 @@ def plot_comparative_metrics_for_all_models(
     fig, ax = plt.subplots(figsize=(10, 6))
     for index, (type_model, metrics) in enumerate(aggregated.items()):
         color = colors[index % len(colors)]
-        steps, mean, std = metrics["train_loss"]
-        plot_series(
-            ax, steps, mean, std, f"{model_names[type_model]} (treino)",
-            color, linestyle="-"
+        steps, mean, _ = metrics["train_loss"]
+        plot_mean(
+            ax, steps, mean, model_names[type_model], color
         )
-        steps, mean, std = metrics["val_loss"]
-        plot_series(
-            ax, steps, mean, std, f"{model_names[type_model]} (validação)",
-            color, linestyle="--"
-        )
-    ax.set(title="Loss por modelo", xlabel="iteração", ylabel="loss")
+    ax.set(title="Loss de treino por modelo (média)", xlabel="passo", ylabel="loss")
     ax.grid(True, linestyle="--", alpha=0.6)
     ax.legend()
     fig.tight_layout()
@@ -335,11 +348,22 @@ def plot_comparative_metrics_for_all_models(
         fig, ax = plt.subplots(figsize=(10, 6))
         for index, (type_model, metrics) in enumerate(aggregated.items()):
             steps, mean, std = metrics[metric_key]
-            plot_series(
-                ax, steps, mean, std, model_names[type_model],
-                colors[index % len(colors)]
+            color = colors[index % len(colors)]
+            label = model_names[type_model]
+            if type_model == "par_shared" and metric_key != "time":
+                label += " (suavizado)"
+            if metric_key == "gap":
+                plot_mean(ax, steps, mean, label, color)
+            else:
+                plot_series(ax, steps, mean, std, label, color)
+        if metric_key == "perplexity":
+            max_step = max(
+                steps[-1] for steps, _, _ in
+                (metrics[metric_key] for metrics in aggregated.values())
             )
-        ax.set(title=title, xlabel="iteração", ylabel=ylabel)
+            if max_step > 100:
+                ax.set_xlim(left=100)
+        ax.set(title=title, xlabel="passo", ylabel=ylabel)
         ax.grid(True, linestyle="--", alpha=0.6)
         ax.legend()
         fig.tight_layout()
