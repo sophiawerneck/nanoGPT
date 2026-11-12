@@ -395,6 +395,7 @@ def generate_table_of_metrics_for_all_models(out_dir, seeds):
         ))
 
     base_latency = models[0]["mean_latency_ms"]
+    base_median_latency = models[0]["median_latency_ms"]
 
     final_metrics = {
         'Modelo': [model_names[type_model] for type_model in model_types],
@@ -409,7 +410,13 @@ def generate_table_of_metrics_for_all_models(out_dir, seeds):
             f"{m['median_latency_ms']:.2f} ({m['iqr_latency_ms']:.4f})"
             for m in models
         ],
-        'Speedup': [round(base_latency / m['mean_latency_ms'], 2) for m in models],
+        'Speedup (latência média)': [
+            round(base_latency / m['mean_latency_ms'], 2) for m in models
+        ],
+        'Speedup (latência mediana)': [
+            round(base_median_latency / m['median_latency_ms'], 2)
+            for m in models
+        ],
     }
 
     df = pd.DataFrame(final_metrics)
