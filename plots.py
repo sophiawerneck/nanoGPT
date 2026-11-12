@@ -261,35 +261,83 @@ def generate_mean_std_time(log_files):
     return mean_time, std_time
 
 
-# Gera todas métricas para um modelo
-def generate_all_metrics(benchmark_files, log_files):
-    benchmarks = []
-    for benchmark_file in _as_paths(benchmark_files):
-        with open(benchmark_file, 'r', encoding='utf-8') as f:
-            benchmarks.append(json.load(f))
-    if not benchmarks:
-        raise ValueError("É necessário fornecer ao menos um arquivo de benchmark.")
+def extract_benchmark_latencies(bench_log_files):
+    latency_pattern = re.compile(
+        r'\b\d+/\d+\s+time:\s*'
+        r'([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)s\b'
+    )
+    latencies_ms = []
+    for bench_log_file in _as_paths(bench_log_files):
+        with open(bench_log_file, encoding="utf-8") as bench_log:
+            for line in bench_log:
+                match = latency_pattern.search(line)
+                if match:
+                    latencies_ms.append(float(match.group(1)) * 1000)
+    return latencies_ms
 
-    sample_counts = [item["inference_num_samples"] for item in benchmarks]
-    if any(count <= 0 for count in sample_counts):
-        raise ValueError("Os benchmarks devem conter amostras de inferência.")
-    total_samples = sum(sample_counts)
-    mean_latency_s = sum(
-        item["inference_latency_mean_s"] * count
-        for item, count in zip(benchmarks, sample_counts)
-    ) / total_samples
-    variance_s = sum(
-        count * (
-            item["inference_latency_std_s"] ** 2
-            + (item["inference_latency_mean_s"] - mean_latency_s) ** 2
+
+# Gera todas métricas para um modelo
+def generate_all_metrics(benchmark_files, log_files, bench_log_files=None):
+    benchmark_paths = _as_paths(benchmark_files)
+    if bench_log_files is None and benchmark_paths:
+        candidate_bench_logs = [
+            os.path.join(os.path.dirname(path), "bench.log")
+            for path in benchmark_paths
+        ]
+        if all(os.path.isfile(path) for path in candidate_bench_logs):
+            bench_log_files = candidate_bench_logs
+
+    if bench_log_files is not None:
+        latencies_ms = extract_benchmark_latencies(bench_log_files)
+        if not latencies_ms:
+            raise ValueError("Nenhuma amostra de latência encontrada nos arquivos bench.log.")
+        mean_latency_ms = float(np.mean(latencies_ms))
+        std_latency_ms = float(np.std(latencies_ms, ddof=0))
+        median_latency_ms = float(np.median(latencies_ms))
+        iqr_latency_ms = float(
+            np.percentile(latencies_ms, 75) - np.percentile(latencies_ms, 25)
         )
-        for item, count in zip(benchmarks, sample_counts)
-    ) / total_samples
+    else:
+        benchmarks = []
+        for benchmark_file in benchmark_paths:
+            with open(benchmark_file, 'r', encoding='utf-8') as f:
+                benchmarks.append(json.load(f))
+        if not benchmarks:
+            raise ValueError("É necessário fornecer ao menos um arquivo de benchmark.")
+
+        sample_counts = [item["inference_num_samples"] for item in benchmarks]
+        if any(count <= 0 for count in sample_counts):
+            raise ValueError("Os benchmarks devem conter amostras de inferência.")
+        total_samples = sum(sample_counts)
+        mean_latency_s = sum(
+            item["inference_latency_mean_s"] * count
+            for item, count in zip(benchmarks, sample_counts)
+        ) / total_samples
+        variance_s = sum(
+            count * (
+                item["inference_latency_std_s"] ** 2
+                + (item["inference_latency_mean_s"] - mean_latency_s) ** 2
+            )
+            for item, count in zip(benchmarks, sample_counts)
+        ) / total_samples
+        mean_latency_ms = mean_latency_s * 1000
+        std_latency_ms = math.sqrt(variance_s) * 1000
+        # Summary JSON files do not retain individual samples; these fallback
+        # quantiles describe the per-seed means, not the underlying samples.
+        seed_means_ms = [
+            item["inference_latency_mean_s"] * 1000 for item in benchmarks
+        ]
+        median_latency_ms = float(np.median(seed_means_ms))
+        iqr_latency_ms = float(
+            np.percentile(seed_means_ms, 75) - np.percentile(seed_means_ms, 25)
+        )
 
     mean_time, std_time = generate_mean_std_time(log_files)
     return {
-        "mean_latency_ms": mean_latency_s * 1000,
-        "std_latency_ms": math.sqrt(variance_s) * 1000,
+        "mean_latency_ms": mean_latency_ms,
+        "std_latency_ms": std_latency_ms,
+        "median_latency_ms": median_latency_ms,
+        "iqr_latency_ms": iqr_latency_ms,
         "mean_time_ms": mean_time,
         "std_time_ms": std_time,
     }
@@ -325,15 +373,26 @@ def generate_table_of_metrics_for_all_models(out_dir, seeds):
     }
     models = []
     for type_model in model_types:
-        benchmark_files = [
-            os.path.join(out_dir, f"{type_model}_s{seed}", "benchmark.json")
+        run_dirs = [
+            os.path.join(out_dir, f"{type_model}_s{seed}")
             for seed in seeds
+            if os.path.isdir(os.path.join(out_dir, f"{type_model}_s{seed}"))
+        ]
+        benchmark_files = [
+            os.path.join(run_dir, "benchmark.json")
+            for run_dir in run_dirs
+        ]
+        bench_log_files = [
+            os.path.join(run_dir, "bench.log")
+            for run_dir in run_dirs
         ]
         log_files = [
-            os.path.join(out_dir, f"{type_model}_s{seed}", "log.txt")
-            for seed in seeds
+            os.path.join(run_dir, "log.txt")
+            for run_dir in run_dirs
         ]
-        models.append(generate_all_metrics(benchmark_files, log_files))
+        models.append(generate_all_metrics(
+            benchmark_files, log_files, bench_log_files=bench_log_files
+        ))
 
     base_latency = models[0]["mean_latency_ms"]
 
@@ -343,7 +402,12 @@ def generate_table_of_metrics_for_all_models(out_dir, seeds):
             fmt(m['mean_time_ms'] / 1000, m['std_time_ms'] / 1000) for m in models
         ],
         'Latência Média (ms)\n± desvio padrão': [
-            fmt(m['mean_latency_ms'], m['std_latency_ms']) for m in models
+            f"{m['mean_latency_ms']:.2f} ± {m['std_latency_ms']:.4f}"
+            for m in models
+        ],
+        'Latência Mediana (ms)\n(IQR)': [
+            f"{m['median_latency_ms']:.2f} ({m['iqr_latency_ms']:.4f})"
+            for m in models
         ],
         'Speedup': [round(base_latency / m['mean_latency_ms'], 2) for m in models],
     }
