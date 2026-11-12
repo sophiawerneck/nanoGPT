@@ -234,6 +234,122 @@ def plot_loss_perplexity_gap_time(
     print(f"Tempo por iteração (mediana): {np.median(time_mean):.1f} ms")
 
 
+def plot_comparative_metrics_for_all_models(
+    out_dir, seeds, path_directory_save=None
+):
+    seeds = list(seeds)
+    if not seeds:
+        raise ValueError("É necessário fornecer ao menos uma seed para gerar os gráficos.")
+
+    model_names = {
+        "seq": "Baseline",
+        "inv": "Invertido",
+        "par": "Paralelo",
+        "par_shared": "Paralelo Compartilhado",
+    }
+    model_runs = {}
+    for type_model in MODEL_TITLES:
+        run_dirs = [
+            os.path.join(out_dir, f"{type_model}_s{seed}")
+            for seed in seeds
+            if os.path.isdir(os.path.join(out_dir, f"{type_model}_s{seed}"))
+        ]
+        if run_dirs:
+            model_runs[type_model] = [
+                get_metrics_from_log(os.path.join(run_dir, "log.txt"))
+                for run_dir in run_dirs
+            ]
+    if not model_runs:
+        raise ValueError(f"Nenhum diretório de execução encontrado em {out_dir}.")
+
+    aggregated = {}
+    for type_model, runs in model_runs.items():
+        metrics = {
+            key: _aggregate_metric(runs, "iteration", key)
+            for key in ("train_loss", "val_loss", "perplexity", "gap")
+        }
+
+        time_runs = []
+        for run in runs:
+            timed_iterations = sorted(run["time_iteration"])
+            warmup_cutoff = timed_iterations[4] if len(timed_iterations) > 4 else None
+            filtered = {
+                "time_iteration": [],
+                "time_per_iteration_ms": [],
+            }
+            for iteration, elapsed in zip(
+                run["time_iteration"], run["time_per_iteration_ms"]
+            ):
+                if warmup_cutoff is None or iteration > warmup_cutoff:
+                    filtered["time_iteration"].append(iteration)
+                    filtered["time_per_iteration_ms"].append(elapsed)
+            time_runs.append(filtered)
+        metrics["time"] = _aggregate_metric(
+            time_runs, "time_iteration", "time_per_iteration_ms"
+        )
+        aggregated[type_model] = metrics
+
+    if path_directory_save is None:
+        path_directory_save = os.path.join(out_dir, "plots_comparativos")
+    os.makedirs(path_directory_save, exist_ok=True)
+
+    colors = plt.get_cmap("tab10").colors
+    paths = {}
+
+    def plot_series(ax, steps, mean, std, label, color, linestyle="-"):
+        ax.plot(steps, mean, label=label, color=color, linestyle=linestyle)
+        ax.fill_between(
+            steps, mean - std, mean + std, color=color, alpha=0.2
+        )
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for index, (type_model, metrics) in enumerate(aggregated.items()):
+        color = colors[index % len(colors)]
+        steps, mean, std = metrics["train_loss"]
+        plot_series(
+            ax, steps, mean, std, f"{model_names[type_model]} (treino)",
+            color, linestyle="-"
+        )
+        steps, mean, std = metrics["val_loss"]
+        plot_series(
+            ax, steps, mean, std, f"{model_names[type_model]} (validação)",
+            color, linestyle="--"
+        )
+    ax.set(title="Loss por modelo", xlabel="iteração", ylabel="loss")
+    ax.grid(True, linestyle="--", alpha=0.6)
+    ax.legend()
+    fig.tight_layout()
+    paths["loss"] = os.path.join(path_directory_save, "loss_comparativo.png")
+    fig.savefig(paths["loss"], dpi=150)
+    plt.close(fig)
+
+    plot_specs = (
+        ("perplexity", "Perplexidade de validação", "perplexity",
+         "perplexidade_validacao_comparativo.png"),
+        ("gap", "Gap de generalização (val - treino)", "diferença de loss",
+         "gap_generalizacao_comparativo.png"),
+        ("time", "Tempo por iteração", "tempo (ms)",
+         "tempo_por_iteracao_comparativo.png"),
+    )
+    for metric_key, title, ylabel, filename in plot_specs:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for index, (type_model, metrics) in enumerate(aggregated.items()):
+            steps, mean, std = metrics[metric_key]
+            plot_series(
+                ax, steps, mean, std, model_names[type_model],
+                colors[index % len(colors)]
+            )
+        ax.set(title=title, xlabel="iteração", ylabel=ylabel)
+        ax.grid(True, linestyle="--", alpha=0.6)
+        ax.legend()
+        fig.tight_layout()
+        paths[metric_key] = os.path.join(path_directory_save, filename)
+        fig.savefig(paths[metric_key], dpi=150)
+        plt.close(fig)
+
+    return paths
+
+
 # Leitura do tempo de treinamento por época
 def _as_paths(paths):
     if isinstance(paths, (str, os.PathLike)):
