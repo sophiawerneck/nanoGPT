@@ -163,75 +163,123 @@ def plot_loss_perplexity_gap_time(
     out_dir, seeds, type_model, path_directory_save, name_file_save,
     smooth=False, start_iter=500
 ):
-    runs = get_metrics_from_seed_logs(out_dir, seeds, type_model)
-    metrics = {
-        key: _aggregate_metric(runs, "iteration", key, smooth=smooth)
-        for key in ("train_loss", "val_loss", "perplexity", "gap")
+    seeds = list(seeds)
+    if not seeds:
+        raise ValueError("É necessário fornecer ao menos uma seed.")
+    if type_model not in MODEL_TITLES:
+        raise ValueError(f"Tipo de bloco desconhecido: {type_model}.")
+
+    model_names = {
+        "seq": "Baseline",
+        "inv": "Invertido",
+        "par": "Paralelo",
+        "par_shared": "Paralelo Compartilhado",
     }
+    aggregated = {}
+    for model_type in MODEL_TITLES:
+        run_dirs = [
+            os.path.join(out_dir, f"{model_type}_s{seed}")
+            for seed in seeds
+            if os.path.isdir(os.path.join(out_dir, f"{model_type}_s{seed}"))
+        ]
+        if not run_dirs:
+            continue
 
-    time_runs = []
-    for run in runs:
-        warmup_cutoff = sorted(run["time_iteration"])[4] if len(run["time_iteration"]) > 4 else None
-        filtered = {
-            "time_iteration": [],
-            "time_per_iteration_ms": [],
+        runs = [
+            get_metrics_from_log(os.path.join(run_dir, "log.txt"))
+            for run_dir in run_dirs
+        ]
+        metrics = {
+            key: _aggregate_metric(runs, "iteration", key, smooth=smooth)
+            for key in ("train_loss", "perplexity", "gap")
         }
-        for iteration, elapsed in zip(run["time_iteration"], run["time_per_iteration_ms"]):
-            if warmup_cutoff is None or iteration > warmup_cutoff:
-                filtered["time_iteration"].append(iteration)
-                filtered["time_per_iteration_ms"].append(elapsed)
-        time_runs.append(filtered)
-    time_steps, time_mean, time_std = _aggregate_metric(
-        time_runs, "time_iteration", "time_per_iteration_ms", smooth=smooth
-    )
 
-    steps, train_mean, train_std = metrics["train_loss"]
-    _, val_mean, val_std = metrics["val_loss"]
-    _, ppl_mean, ppl_std = metrics["perplexity"]
-    _, gap_mean, gap_std = metrics["gap"]
-    best = int(np.argmin(val_mean))
+        time_runs = []
+        for run in runs:
+            timed_iterations = sorted(run["time_iteration"])
+            warmup_cutoff = timed_iterations[4] if len(timed_iterations) > 4 else None
+            filtered = {
+                "time_iteration": [],
+                "time_per_iteration_ms": [],
+            }
+            for iteration, elapsed in zip(
+                run["time_iteration"], run["time_per_iteration_ms"]
+            ):
+                if warmup_cutoff is None or iteration > warmup_cutoff:
+                    filtered["time_iteration"].append(iteration)
+                    filtered["time_per_iteration_ms"].append(elapsed)
+            time_runs.append(filtered)
+        metrics["time"] = _aggregate_metric(
+            time_runs, "time_iteration", "time_per_iteration_ms", smooth=smooth
+        )
+        aggregated[model_type] = metrics
+
+    if not aggregated:
+        raise ValueError(f"Nenhum diretório de execução encontrado em {out_dir}.")
 
     fig, ax = plt.subplots(2, 2, figsize=(12, 8))
-
-    # 1) loss de treino e validação, com o melhor ponto marcado
-    _plot_mean_std(ax[0, 0], steps, train_mean, train_std, 'treino')
-    _plot_mean_std(ax[0, 0], steps, val_mean, val_std, 'validação')
-    _set_y_limits_from_iteration(
-        ax[0, 0], steps, ((train_mean, train_std), (val_mean, val_std)), start_iter
+    colors = plt.get_cmap("tab10").colors
+    metric_axes = (
+        (ax[0, 0], "train_loss", "Loss de Treinamento", "loss"),
+        (ax[0, 1], "perplexity", "Perplexidade de Validação", "perplexidade"),
+        (ax[1, 0], "gap", "Gap de Generalização (Val - Treino)", "diferença de loss"),
+        (ax[1, 1], "time", "Tempo por Iteração", "ms"),
     )
-    ax[0, 0].axvline(steps[best], color='gray', linestyle='--', label=f'melhor val (iter {steps[best]})')
-    ax[0, 0].set_title('Loss'); ax[0, 0].set_xlabel('iteração'); ax[0, 0].set_ylabel('loss'); ax[0, 0].legend()
+    plotted_series = {key: [] for _, key, _, _ in metric_axes}
 
-    # 2) perplexity de validação
-    _plot_mean_std(ax[0, 1], steps, ppl_mean, ppl_std, 'perplexity', color='tab:orange')
-    _set_y_limits_from_iteration(
-        ax[0, 1], steps, ((ppl_mean, ppl_std),), start_iter
-    )
-    ax[0, 1].set_title('Perplexity de validação (exp da loss)'); ax[0, 1].set_xlabel('iteração'); ax[0, 1].set_ylabel('perplexity')
+    def plot_model_series(axis, steps, mean, std, label, color):
+        line, = axis.plot(steps, mean, label=label, color=color)
+        axis.fill_between(
+            steps, mean - std, mean + std, color=line.get_color(), alpha=0.2
+        )
 
-    # 3) diferença validação - treino (overfitting)
-    _plot_mean_std(ax[1, 0], steps, gap_mean, gap_std, 'gap', color='tab:red')
-    _set_y_limits_from_iteration(ax[1, 0], steps, ((gap_mean, gap_std),), start_iter)
-    ax[1, 0].set_title('Gap de generalização (val - treino)'); ax[1, 0].set_xlabel('iteração'); ax[1, 0].set_ylabel('diferença de loss')
+    for index, (model_type, metrics) in enumerate(aggregated.items()):
+        color = colors[index % len(colors)]
+        label = model_names[model_type]
+        for axis, metric_key, _, _ in metric_axes:
+            steps, mean, std = metrics[metric_key]
+            plot_model_series(axis, steps, mean, std, label, color)
+            plotted_series[metric_key].append((steps, mean, std))
 
-    # 4) tempo por iteração (ignorando as primeiras, que incluem aquecimento)
-    _plot_mean_std(ax[1, 1], time_steps, time_mean, time_std, 'tempo', color='tab:green')
-    _set_y_limits_from_iteration(
-        ax[1, 1], time_steps, ((time_mean, time_std),), start_iter
-    )
-    ax[1, 1].set_title('Tempo por iteração'); ax[1, 1].set_xlabel('iteração'); ax[1, 1].set_ylabel('ms')
+    for axis, metric_key, title, ylabel in metric_axes:
+        axis.set_title(title)
+        axis.set_xlabel("passo")
+        axis.set_ylabel(ylabel)
+        axis.grid(True, linestyle="--", alpha=0.6)
+        axis.legend()
+        if start_iter is not None:
+            bounds = []
+            for steps, mean, std in plotted_series[metric_key]:
+                visible = steps >= start_iter
+                if visible.any():
+                    bounds.extend((
+                        mean[visible] - std[visible],
+                        mean[visible] + std[visible],
+                    ))
+            if bounds:
+                visible_bounds = np.concatenate(bounds)
+                visible_bounds = visible_bounds[np.isfinite(visible_bounds)]
+                if visible_bounds.size:
+                    low, high = visible_bounds.min(), visible_bounds.max()
+                    padding = max((high - low) * 0.05, abs(low) * 0.05, 0.05)
+                    axis.set_ylim(low - padding, high + padding)
 
-    fig.suptitle(MODEL_TITLES[type_model])
+    fig.suptitle("Comparação dos Modelos")
     plt.tight_layout()
 
     os.makedirs(path_directory_save, exist_ok=True)
     fig.savefig(name_file_save, dpi=150)
     plt.show()
 
-    # --- resumo em texto, útil para a tabela do relatório ---
-    print(f"Melhor val loss: {val_mean[best]:.4f} (iter {steps[best]}), perplexity: {ppl_mean[best]:.2f}")
-    print(f"Loss final: treino {train_mean[-1]:.4f}, validação {val_mean[-1]:.4f}")
-    print(f"Tempo por iteração (mediana): {np.median(time_mean):.1f} ms")
+    for model_type, metrics in aggregated.items():
+        _, train_mean, _ = metrics["train_loss"]
+        _, ppl_mean, _ = metrics["perplexity"]
+        _, time_mean, _ = metrics["time"]
+        print(
+            f"{model_names[model_type]} — loss treino final: {train_mean[-1]:.4f}, "
+            f"perplexidade final: {ppl_mean[-1]:.2f}, "
+            f"tempo mediano: {np.median(time_mean):.1f} ms"
+        )
 
 
 def plot_comparative_metrics_for_all_models(
