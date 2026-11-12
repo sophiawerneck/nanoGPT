@@ -264,22 +264,9 @@ def plot_comparative_metrics_for_all_models(
 
     aggregated = {}
     for type_model, runs in model_runs.items():
-        if type_model == "par_shared":
-            smoothed_runs = []
-            for run in runs:
-                smoothed_run = dict(run)
-                for key in (
-                    "train_loss", "val_loss", "perplexity", "gap",
-                ):
-                    smoothed_run[key] = pd.Series(run[key]).rolling(
-                        window=5, min_periods=1, center=True
-                    ).mean().to_list()
-                smoothed_runs.append(smoothed_run)
-            runs = smoothed_runs
-
         metrics = {
             key: _aggregate_metric(runs, "iteration", key)
-            for key in ("train_loss", "val_loss", "perplexity", "gap")
+            for key in ("val_loss", "perplexity", "gap")
         }
 
         time_runs = []
@@ -321,27 +308,53 @@ def plot_comparative_metrics_for_all_models(
             steps, mean - std, mean + std, color=color, alpha=0.2
         )
 
+    def apply_zoom(ax, metric_key, start_step):
+        bounds = []
+        for metrics in aggregated.values():
+            steps, mean, std = metrics[metric_key]
+            visible = steps >= start_step
+            if visible.any():
+                bounds.extend((mean[visible] - std[visible], mean[visible] + std[visible]))
+        if not bounds:
+            return
+
+        values = np.concatenate(bounds)
+        values = values[np.isfinite(values)]
+        if not values.size:
+            return
+        low, high = values.min(), values.max()
+        padding = max((high - low) * 0.05, max(abs(low), abs(high), 1) * 0.01)
+        ax.set_xlim(left=start_step)
+        ax.set_ylim(low - padding, high + padding)
+
+    zoom_start_step = 250
     fig, ax = plt.subplots(figsize=(10, 6))
     for index, (type_model, metrics) in enumerate(aggregated.items()):
         color = colors[index % len(colors)]
-        steps, mean, _ = metrics["train_loss"]
-        plot_mean(
-            ax, steps, mean, model_names[type_model], color
+        steps, mean, std = metrics["val_loss"]
+        plot_series(
+            ax, steps, mean, std, model_names[type_model], color
         )
-    ax.set(title="Loss de treino por modelo (média)", xlabel="passo", ylabel="loss")
-    ax.grid(True, linestyle="--", alpha=0.6)
+    ax.set(
+        title="Loss de Validação por Modelo",
+        xlabel="Passo",
+        ylabel="Loss de Validação",
+    )
+    apply_zoom(ax, "val_loss", zoom_start_step)
+    ax.grid(True, linestyle="--", alpha=0.5)
     ax.legend()
     fig.tight_layout()
     paths["loss"] = os.path.join(path_directory_save, "loss_comparativo.png")
-    fig.savefig(paths["loss"], dpi=150)
+    fig.savefig(paths["loss"], dpi=300)
     plt.close(fig)
 
     plot_specs = (
-        ("perplexity", "Perplexidade de validação", "perplexity",
+        ("perplexity", "Perplexidade de Validação", "Perplexidade de Validação",
          "perplexidade_validacao_comparativo.png"),
-        ("gap", "Gap de generalização (val - treino)", "diferença de loss",
+        ("gap", "Gap de Generalização (Val - Treino)",
+         "Gap de Generalização (Val - Treino)",
          "gap_generalizacao_comparativo.png"),
-        ("time", "Tempo por iteração", "tempo (ms)",
+        ("time", "Tempo por iteração", "Tempo por iteração (ms)",
          "tempo_por_iteracao_comparativo.png"),
     )
     for metric_key, title, ylabel, filename in plot_specs:
@@ -349,26 +362,15 @@ def plot_comparative_metrics_for_all_models(
         for index, (type_model, metrics) in enumerate(aggregated.items()):
             steps, mean, std = metrics[metric_key]
             color = colors[index % len(colors)]
-            label = model_names[type_model]
-            if type_model == "par_shared" and metric_key != "time":
-                label += " (suavizado)"
-            if metric_key == "gap":
-                plot_mean(ax, steps, mean, label, color)
-            else:
-                plot_series(ax, steps, mean, std, label, color)
+            plot_series(ax, steps, mean, std, model_names[type_model], color)
         if metric_key == "perplexity":
-            max_step = max(
-                steps[-1] for steps, _, _ in
-                (metrics[metric_key] for metrics in aggregated.values())
-            )
-            if max_step > 100:
-                ax.set_xlim(left=100)
-        ax.set(title=title, xlabel="passo", ylabel=ylabel)
-        ax.grid(True, linestyle="--", alpha=0.6)
+            apply_zoom(ax, metric_key, zoom_start_step)
+        ax.set(title=title, xlabel="Passo", ylabel=ylabel)
+        ax.grid(True, linestyle="--", alpha=0.5)
         ax.legend()
         fig.tight_layout()
         paths[metric_key] = os.path.join(path_directory_save, filename)
-        fig.savefig(paths[metric_key], dpi=150)
+        fig.savefig(paths[metric_key], dpi=300)
         plt.close(fig)
 
     return paths
