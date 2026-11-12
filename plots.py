@@ -267,6 +267,12 @@ def plot_loss_perplexity_gap_time(
         label = model_names[model_type]
         for axis, metric_key, _, _ in metric_axes:
             steps, mean, std = metrics[metric_key]
+            if metric_key in ("val_loss", "perplexity"):
+                visible = (steps >= start_iter) & (steps <= 6000)
+                steps, mean, std = steps[visible], mean[visible], std[visible]
+            elif metric_key == "gap":
+                visible = (steps >= 0) & (steps <= 6000)
+                steps, mean, std = steps[visible], mean[visible], std[visible]
             plot_model_series(axis, steps, mean, std, label, color)
 
     for axis, metric_key, title, ylabel in metric_axes:
@@ -276,13 +282,11 @@ def plot_loss_perplexity_gap_time(
         axis.grid(True, linestyle="--", alpha=0.6)
         axis.legend()
 
-    def apply_zoom(axis, metric_key):
+    def apply_limits(axis, metric_key, min_step, max_step):
         bounds = []
-        max_step = None
         for metrics in aggregated.values():
             steps, mean, std = metrics[metric_key]
-            max_step = steps[-1] if max_step is None else max(max_step, steps[-1])
-            visible = steps >= start_iter
+            visible = (steps >= min_step) & (steps <= max_step)
             if visible.any():
                 visible_mean = mean[visible]
                 visible_std = std[visible]
@@ -296,10 +300,7 @@ def plot_loss_perplexity_gap_time(
                     lower,
                     upper,
                 ))
-        if max_step is None or max_step <= start_iter:
-            return
-
-        axis.set_xlim(left=start_iter, right=max_step)
+        axis.set_xlim(left=min_step, right=max_step)
         if not bounds:
             return
         values = np.concatenate(bounds)
@@ -312,9 +313,10 @@ def plot_loss_perplexity_gap_time(
             padding = max(abs(low) * 0.05, 0.05)
         axis.set_ylim(low - padding, high + padding)
 
-    if start_iter is not None:
-        apply_zoom(ax[0, 0], "val_loss")
-        apply_zoom(ax[0, 1], "perplexity")
+    zoom_start_step = 1000 if start_iter is None else start_iter
+    apply_limits(ax[0, 0], "val_loss", zoom_start_step, 6000)
+    apply_limits(ax[0, 1], "perplexity", zoom_start_step, 6000)
+    apply_limits(ax[1, 0], "gap", 0, 6000)
 
     fig.suptitle("Comparação dos Modelos")
     plt.tight_layout()
@@ -327,11 +329,13 @@ def plot_loss_perplexity_gap_time(
         val_steps, val_mean, _ = metrics["val_loss"]
         ppl_steps, ppl_mean, _ = metrics["perplexity"]
         _, time_mean, _ = metrics["time"]
-        final_step = min(val_steps[-1], ppl_steps[-1])
+        val_regular = val_steps <= 6000
+        ppl_regular = ppl_steps <= 6000
+        final_step = min(val_steps[val_regular][-1], ppl_steps[ppl_regular][-1])
         print(
             f"{model_names[model_type]} — passo final {final_step}: "
-            f"loss de validação {val_mean[-1]:.4f}, "
-            f"perplexidade {ppl_mean[-1]:.2f}; "
+            f"loss de validação {val_mean[val_regular][-1]:.4f}, "
+            f"perplexidade {ppl_mean[ppl_regular][-1]:.2f}; "
             f"tempo mediano {np.median(time_mean):.1f} ms"
         )
 
