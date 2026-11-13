@@ -186,7 +186,7 @@ def plot_loss_perplexity_gap_time(
     model_names = {
         "seq": "Baseline",
         "inv": "Invertido",
-        "par": "Paralelo",
+        "par": "Paralelo Independente",
         "par_shared": "Paralelo Compartilhado",
     }
     aggregated = {}
@@ -280,7 +280,12 @@ def plot_loss_perplexity_gap_time(
         axis.set_xlabel("passo")
         axis.set_ylabel(ylabel)
         axis.grid(True, linestyle="--", alpha=0.6)
-        axis.legend()
+
+    handles, labels = ax[0, 0].get_legend_handles_labels()
+    fig.legend(
+        handles, labels, loc="lower center",
+        bbox_to_anchor=(0.5, 0.01), ncol=len(labels)
+    )
 
     def apply_limits(axis, metric_key, min_step, max_step):
         bounds = []
@@ -319,7 +324,7 @@ def plot_loss_perplexity_gap_time(
     apply_limits(ax[1, 0], "gap", 0, 6000)
 
     fig.suptitle("Comparação dos Modelos")
-    plt.tight_layout()
+    plt.tight_layout(rect=(0, 0.07, 1, 0.95))
 
     os.makedirs(path_directory_save, exist_ok=True)
     fig.savefig(name_file_save, dpi=300, bbox_inches="tight")
