@@ -100,18 +100,18 @@ python bench.py --out_dir out/c4/par_s1337
 python bench.py --out_dir out/c4/par_shared_s1337
 ```
 
-(Repita para as demais sementes).
+Repita para as demais sementes. Os resultados são armazenados em benchmark.json.
 
 #### Geração de Texto (Análise Qualitativa)
-Para ver os modelos em ação gerando texto livre e avaliar qualitativamente o que foi aprendido:
+A geração de cinco amostras de texto já é executada automaticamente pelo run_all.sh, sendo armazenada em samples_text.txt no diretório de cada execução. Para realizar a geração manualmente:
 
 ```bash
-python sample.py --init_from resume --out_dir out/seq_s1337
+python sample.py --init_from resume --out_dir out/c4/seq_s1337
 ```
-(Você pode customizar a geração editando argumentos via terminal, ex: --max_new_tokens 200 --temperature 0.8).
+É possível personalizar a geração por meio de argumentos, como --num_samples, --max_new_tokens e --temperature.
 
 #### Agregação de Resultados
-​Por fim, consolide todas as métricas de Treino, Avaliação e Benchmark de todas as pastas em tabelas CSV, Markdown e gráficos:
+Por fim, consolide as métricas de treinamento, avaliação e benchmark das execuções em tabelas e gráficos:
 ```bash
-python summarize.py
+python summarize.py --out_root out/c4
 ```
