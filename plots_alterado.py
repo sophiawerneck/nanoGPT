@@ -252,8 +252,8 @@ def plot_loss_perplexity_gap_time(
     metric_axes = (
         (ax[0, 0], "val_loss", "Loss de Validação", "Loss de Validação"),
         (ax[0, 1], "perplexity", "Perplexidade de Validação", "Perplexidade"),
-        (ax[1, 0], "gap", "Gap de Generalização (Val - Treino)", "diferença de loss"),
-        (ax[1, 1], "time", "Tempo por Iteração", "ms"),
+        (ax[1, 0], "gap", "Gap de Generalização (Val - Treino)", "Diferença de Loss"),
+        (ax[1, 1], "time", "Tempo por Iteração", "Tempo (ms)"),
     )
 
     def plot_model_series(axis, steps, mean, std, label, color):
@@ -277,7 +277,7 @@ def plot_loss_perplexity_gap_time(
 
     for axis, metric_key, title, ylabel in metric_axes:
         axis.set_title(title)
-        axis.set_xlabel("passo")
+        axis.set_xlabel("Passo")
         axis.set_ylabel(ylabel)
         axis.grid(True, linestyle="--", alpha=0.6)
 
