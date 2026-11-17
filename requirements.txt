@@ -1,7 +1,11 @@
 torch==2.14.1
-numpy
-tiktoken
-requests
-simple-parsing
-huggingface_hub
-datasets
+numpy==2.4.6
+tiktoken==0.14.0
+simple-parsing==0.1.9
+transformers==5.22.1
+datasets==4.8.5
+huggingface_hub==1.33.0
+requests==2.32.4
+tqdm==4.67.3
+pandas>=2.2
+matplotlib>=3.10
