@@ -86,7 +86,7 @@ python train.py --block_type inv --seed 1337
 python train.py --block_type par --seed 1337
 python train.py --block_type par_shared --seed 1337
 ```
-Repita para as demais sementes. Os resultados são armazenados em benchmark.json.
+Repita os quatro comandos com as sementes 1338 e 1339. Os checkpoints, as métricas de treinamento e os resultados da avaliação final são armazenados no diretório de cada execução.
 
 Para retomar um treinamento interrompido a partir do último checkpoint salvo, adicione --init_from resume.
 Cada execução grava seus artefatos, métricas e resultados de avaliação em out/c4/<variante>_s<semente>/.
