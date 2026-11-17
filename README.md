@@ -22,15 +22,7 @@ Este trabalho investiga o impacto de rearranjos estruturais das camadas de Aten�
 
 ### Instalação
 
-Clonar o repositório:
-
-```bash
-git clone https://github.com/sophiawerneck/NOME_DO_REPOSITORIO/
-cd <NOME_DO_REPOSITORIO>
-```
-
-Instalar as dependências:
-
+Após receber os arquivos do projeto, acesse o diretório raiz pelo terminal e instale as dependências:
 ```bash
 pip install -r requirements.txt
 ```
@@ -40,19 +32,24 @@ pip install -r requirements.txt
 
 ## Reprodução dos resultados
 
-<!-- Apresentar os comandos exatos, na ordem de execução,
-     necessários para reproduzir os principais resultados do projeto. -->
-Todos os resultados do relatório são reproduzidos por um único comando, que executa as etapas abaixo em ordem:
+### Execução automatizada
+Os resultados do relatório podem ser reproduzidos por meio de um único comando, que executa as etapas do experimento em sequência:
+
 ```bash
 bash run_all.sh
 ```
 Por padrão, o experimento treina quatro variantes (seq, inv, par e par_shared), com três sementes cada (1337, 1338 e 1339), totalizando 12 execuções.
 
-O pipeline realiza automaticamente a preparação dos dados, os treinamentos, a avaliação final, o benchmark de inferência, a geração de amostras de texto e a agregação dos resultados.
+O pipeline realiza automaticamente a preparação dos dados, o treinamento das variantes para cada semente, a avaliação final, o benchmark de inferência, a geração de 5 amostras de texto e a agregação dos resultados.
 
-O script pode ser executado novamente após uma interrupção, retomando os treinamentos a partir dos checkpoints disponíveis e ignorando as execuções já concluídas. Variações de execução:
+Os checkpoints, as métricas e os resultados de cada execução são armazenados em seus respectivos diretórios. As amostras geradas são salvas em samples_text.txt, e os resultados do benchmark, em benchmark.json.
 
-Variações de execução
+O script pode ser executado novamente após uma interrupção. Quando encontra um summary.json, ignora o treinamento daquela execução. Se encontra um checkpoint, mas não o resumo final, retoma o treinamento a partir do checkpoint disponível. Caso contrário, inicia o treinamento do zero. O benchmark e a geração de amostras são executados novamente, inclusive para treinamentos já concluídos.
+
+### Variações de execução
+
+É possível alterar a configuração do experimento por meio das seguintes variáveis:
+
 ```bash
 SEEDS="1337" bash run_all.sh
 # Executa apenas uma semente.
@@ -67,10 +64,11 @@ TRAIN_ARGS="--peak_tflops VALOR" bash run_all.sh
 # Define o pico teórico utilizado no cálculo da MFU.
 
 ```
+
 Para utilizar outra GPU, ajuste --peak_tflops conforme o modelo e a precisão numérica utilizados. Para utilizar múltiplas GPUs, ajuste NPROC conforme a quantidade de GPUs disponíveis.
 
 ### Passo a passo manual
-Caso queira executar as etapas individualmente em vez de usar o run_all.sh, siga o fluxo abaixo:
+Caso queira executar as etapas individualmente, sem utilizar o run_all.sh, siga o fluxo abaixo.
 
 #### Preparação dos dados
 ```bash
@@ -80,19 +78,32 @@ Gera train.bin e validation.bin a partir do C4 em inglês, utilizando o tokeniza
 
 #### Treinamento e avaliação 
 A avaliação final da perplexidade é integrada ao script de treinamento e ocorre automaticamente na última iteração. Ela utiliza a porção holdout da validação, separada do subconjunto empregado no monitoramento periódico.
+
+Execute os comandos para cada variante:
+
 ```bash
 python train.py --block_type seq --seed 1337
 python train.py --block_type inv --seed 1337
 python train.py --block_type par --seed 1337
 python train.py --block_type par_shared --seed 1337
 ```
-Repita os quatro comandos com as sementes 1338 e 1339. Os checkpoints, as métricas de treinamento e os resultados da avaliação final são armazenados no diretório de cada execução.
+Repita os quatro comandos com as sementes 1338 e 1339.
 
-Para retomar um treinamento interrompido a partir do último checkpoint salvo, adicione --init_from resume.
-Cada execução grava seus artefatos, métricas e resultados de avaliação em out/c4/<variante>_s<semente>/.
+Para retomar manualmente um treinamento interrompido a partir do último checkpoint salvo, adicione --init_from resume. 
+
+Por exemplo:
+```bash
+python sample.py --init_from resume --out_dir out/c4/seq_s1337 --num_samples 5
+```
+
+Cada execução grava seus checkpoints, métricas e resultados de avaliação em out/c4/<variante>_s<semente>/.
+Para treinar com múltiplas GPUs em um único nó, utilize torchrun. Por exemplo:
+```bash
+torchrun --standalone --nproc_per_node=4 train.py --block_type seq --seed 1337
+```
 
 #### Benchmark de Latência
-Após o treinamento, meça a latência média de geração e o throughput de inferência para cada modelo salvo:
+Após o treinamento, execute os seguintes comandos:
 ```bash
 python bench.py --out_dir out/c4/seq_s1337
 python bench.py --out_dir out/c4/inv_s1337
@@ -103,15 +114,15 @@ python bench.py --out_dir out/c4/par_shared_s1337
 Repita para as demais sementes. Os resultados são armazenados em benchmark.json.
 
 #### Geração de Texto (Análise Qualitativa)
-A geração de cinco amostras de texto já é executada automaticamente pelo run_all.sh, sendo armazenada em samples_text.txt no diretório de cada execução. Para realizar a geração manualmente:
+Para gerar amostras manualmente, execute:
 
 ```bash
 python sample.py --init_from resume --out_dir out/c4/seq_s1337
 ```
-É possível personalizar a geração por meio de argumentos, como --num_samples, --max_new_tokens e --temperature.
+É possível personalizar a geração por meio de argumentos como --num_samples, --max_new_tokens e --temperature. A geração manual precisa ser executada para cada modelo que se deseja analisar.
 
 #### Agregação de Resultados
-Por fim, consolide as métricas de treinamento, avaliação e benchmark das execuções em tabelas e gráficos:
+Por fim, consolide os resultados das execuções:
 ```bash
 python summarize.py --out_root out/c4
 ```
