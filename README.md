@@ -126,3 +126,4 @@ Por fim, consolide os resultados das execuções:
 ```bash
 python summarize.py --out_root out/c4
 ```
+
